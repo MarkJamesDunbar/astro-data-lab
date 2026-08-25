@@ -1,0 +1,649 @@
+<title>TESS Starhunter</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;700;800&family=Source+Serif+4:opsz,wght@8..60,400;8..60,500;8..60,600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+
+<style>
+  :root {
+    --bg: #f4f5fb;
+    --surface: #ffffff;
+    --surface-2: #eceef7;
+    --border: #d8dbe9;
+    --text: #171a2b;
+    --text-muted: #5a6079;
+    --accent: #c15a10;
+    --accent-soft: #f3e0cc;
+    --accent-2: #0f8577;
+    --accent-2-soft: #d9efe9;
+    --shadow: 0 1px 2px rgba(23, 26, 43, 0.06), 0 8px 24px -12px rgba(23, 26, 43, 0.12);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0a0d17;
+      --surface: #12162a;
+      --surface-2: #191f38;
+      --border: #2b3155;
+      --text: #e9ecf8;
+      --text-muted: #9aa1c4;
+      --accent: #ff9d4d;
+      --accent-soft: #3a2717;
+      --accent-2: #6fe1cf;
+      --accent-2-soft: #12332f;
+      --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 12px 28px -14px rgba(0,0,0,0.6);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0a0d17;
+    --surface: #12162a;
+    --surface-2: #191f38;
+    --border: #2b3155;
+    --text: #e9ecf8;
+    --text-muted: #9aa1c4;
+    --accent: #ff9d4d;
+    --accent-soft: #3a2717;
+    --accent-2: #6fe1cf;
+    --accent-2-soft: #12332f;
+    --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 12px 28px -14px rgba(0,0,0,0.6);
+  }
+
+  * { box-sizing: border-box; }
+  ::selection { background: var(--accent-soft); color: var(--text); }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Source Serif 4', Georgia, 'Times New Roman', serif;
+    font-size: 17px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap {
+    max-width: 880px;
+    margin: 0 auto;
+    padding: 3.5rem 1.5rem 6rem;
+  }
+
+  a { color: var(--accent-2); }
+
+  h1, h2, h3, .display {
+    font-family: 'Big Shoulders Display', system-ui, sans-serif;
+    text-transform: uppercase;
+    letter-spacing: 0.01em;
+    text-wrap: balance;
+    font-weight: 700;
+    margin: 0;
+  }
+
+  code, .mono {
+    font-family: 'IBM Plex Mono', ui-monospace, 'Courier New', monospace;
+  }
+
+  /* ---------- masthead ---------- */
+  .masthead { margin-bottom: 3rem; }
+
+  .eyebrow {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.72rem;
+    letter-spacing: 0.14em;
+    color: var(--text-muted);
+    margin-bottom: 0.9rem;
+  }
+
+  h1.title {
+    font-size: clamp(2.6rem, 6vw, 4rem);
+    line-height: 0.98;
+    color: var(--text);
+  }
+  h1.title em {
+    font-style: normal;
+    color: var(--accent);
+  }
+
+  .subhead {
+    font-size: 1.15rem;
+    color: var(--text-muted);
+    margin: 1.1rem 0 1.6rem;
+  }
+
+  .chip-row { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 1.8rem; }
+  .chip {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.74rem;
+    letter-spacing: 0.03em;
+    padding: 0.28rem 0.62rem;
+    border-radius: 3px;
+    border: 1px solid var(--border);
+    color: var(--text-muted);
+    background: var(--surface);
+  }
+
+  .progress-block {
+    border: 1px solid var(--border);
+    background: var(--surface);
+    border-radius: 8px;
+    padding: 1rem 1.2rem;
+    box-shadow: var(--shadow);
+  }
+  .progress-block .label-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.78rem;
+    color: var(--text-muted);
+    margin-bottom: 0.55rem;
+  }
+  .progress-block .label-row span.count {
+    font-variant-numeric: tabular-nums;
+    color: var(--text);
+  }
+  .bar-track {
+    height: 8px;
+    border-radius: 4px;
+    background: var(--surface-2);
+    overflow: hidden;
+  }
+  .bar-fill {
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, var(--accent-2), var(--accent));
+    transition: width 0.35s ease;
+    border-radius: 4px;
+  }
+
+  /* ---------- reading table ---------- */
+  .reading {
+    margin: 0 0 3.5rem;
+  }
+  .reading h2 { font-size: 1.3rem; margin-bottom: 0.3rem; }
+  .reading .note { color: var(--text-muted); font-size: 0.95rem; margin: 0 0 1rem; }
+  .table-scroll { overflow-x: auto; border: 1px solid var(--border); border-radius: 8px; box-shadow: var(--shadow); }
+  table { width: 100%; border-collapse: collapse; background: var(--surface); font-size: 0.92rem; }
+  thead th {
+    text-align: left;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.7rem;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+    background: var(--surface-2);
+    padding: 0.6rem 0.9rem;
+    white-space: nowrap;
+  }
+  tbody td { padding: 0.7rem 0.9rem; border-top: 1px solid var(--border); vertical-align: top; }
+  tbody tr:hover { background: var(--surface-2); }
+  td.year { font-family: 'IBM Plex Mono', monospace; font-variant-numeric: tabular-nums; color: var(--text-muted); }
+  td.paper strong { display: block; color: var(--text); }
+  td.paper span { color: var(--text-muted); font-size: 0.85rem; }
+
+  /* ---------- phase nav ---------- */
+  .phase-nav {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    margin-bottom: 3rem;
+  }
+  .phase-nav a {
+    text-decoration: none;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    border: 1px solid var(--border);
+    background: var(--surface);
+    padding: 0.32rem 0.6rem;
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+  .phase-nav a .dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--border);
+  }
+  .phase-nav a.done .dot { background: var(--accent-2); }
+  .phase-nav a:hover { color: var(--text); border-color: var(--accent); }
+
+  /* ---------- timeline ---------- */
+  .timeline {
+    position: relative;
+    padding-left: 2.6rem;
+  }
+  .timeline::before {
+    content: "";
+    position: absolute;
+    left: 0.95rem;
+    top: 0.6rem;
+    bottom: 0.6rem;
+    width: 1px;
+    background: var(--border);
+  }
+
+  .phase {
+    position: relative;
+    margin-bottom: 3rem;
+    scroll-margin-top: 1.5rem;
+  }
+  .phase-marker {
+    position: absolute;
+    left: -2.6rem;
+    top: 0.15rem;
+    width: 1.9rem;
+    height: 1.9rem;
+    border-radius: 50%;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-muted);
+  }
+  .phase-marker svg { width: 15px; height: 15px; }
+
+  .phase-card {
+    border: 1px solid var(--border);
+    background: var(--surface);
+    border-radius: 8px;
+    padding: 1.3rem 1.5rem 1.5rem;
+    box-shadow: var(--shadow);
+  }
+  .phase-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 1rem;
+    flex-wrap: wrap;
+    margin-bottom: 0.3rem;
+  }
+  .phase-num {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.72rem;
+    letter-spacing: 0.14em;
+    color: var(--accent-2);
+  }
+  .phase-card h2 { font-size: 1.5rem; margin: 0.15rem 0 0.6rem; }
+  .effort {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.68rem;
+    letter-spacing: 0.08em;
+    padding: 0.22rem 0.5rem;
+    border-radius: 3px;
+    background: var(--surface-2);
+    color: var(--text-muted);
+    white-space: nowrap;
+    height: fit-content;
+  }
+  .why {
+    color: var(--text-muted);
+    font-size: 0.98rem;
+    margin: 0 0 1rem;
+    font-style: italic;
+  }
+
+  .tasks { list-style: none; margin: 0 0 1rem; padding: 0; display: flex; flex-direction: column; gap: 0.55rem; }
+  .tasks li {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.6rem;
+    font-size: 0.96rem;
+  }
+  .tasks input[type="checkbox"] {
+    appearance: none;
+    -webkit-appearance: none;
+    width: 1.05rem;
+    height: 1.05rem;
+    min-width: 1.05rem;
+    margin-top: 0.2rem;
+    border: 1.5px solid var(--border);
+    border-radius: 3px;
+    background: var(--surface);
+    cursor: pointer;
+    position: relative;
+  }
+  .tasks input[type="checkbox"]:checked {
+    background: var(--accent-2);
+    border-color: var(--accent-2);
+  }
+  .tasks input[type="checkbox"]:checked::after {
+    content: "";
+    position: absolute;
+    left: 3px; top: -1px;
+    width: 5px; height: 9px;
+    border: solid var(--surface);
+    border-width: 0 2px 2px 0;
+    transform: rotate(40deg);
+  }
+  .tasks input[type="checkbox"]:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  .tasks label { cursor: pointer; }
+  .tasks li.checked label { color: var(--text-muted); text-decoration: line-through; text-decoration-color: var(--border); }
+
+  .tech-row { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.9rem; }
+  .tech-row .tag {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.68rem;
+    color: var(--accent-2);
+    background: var(--accent-2-soft);
+    padding: 0.2rem 0.5rem;
+    border-radius: 3px;
+  }
+
+  .phase-mini-bar { height: 4px; border-radius: 2px; background: var(--surface-2); overflow: hidden; margin-top: 1rem; }
+  .phase-mini-fill { height: 100%; width: 0%; background: var(--accent-2); transition: width 0.3s ease; }
+
+  /* ---------- later ---------- */
+  .later {
+    border: 1px dashed var(--border);
+    border-radius: 8px;
+    padding: 1.3rem 1.5rem;
+    margin-top: 1rem;
+  }
+  .later h2 { font-size: 1.15rem; margin-bottom: 0.6rem; color: var(--text-muted); }
+  .later ul { margin: 0; padding-left: 1.2rem; color: var(--text-muted); font-size: 0.95rem; }
+  .later li { margin-bottom: 0.35rem; }
+
+  footer {
+    margin-top: 4rem;
+    padding-top: 1.5rem;
+    border-top: 1px solid var(--border);
+    color: var(--text-muted);
+    font-size: 0.88rem;
+  }
+  footer .mono { color: var(--text-muted); }
+
+  @media (max-width: 560px) {
+    .timeline { padding-left: 1.8rem; }
+    .timeline::before { left: 0.6rem; }
+    .phase-marker { left: -1.8rem; width: 1.5rem; height: 1.5rem; }
+    .phase-marker svg { width: 11px; height: 11px; }
+  }
+</style>
+
+<div class="wrap">
+
+  <header class="masthead">
+    <div class="eyebrow">astro-data-lab · project roadmap · last updated 2026-08-25</div>
+    <h1 class="title">TESS <em>Starhunter</em></h1>
+    <p class="subhead">A phased roadmap for a homebrew Linux box that ingests photometric survey data including TESS, Kepler, and K2, and learns to classify stars (hopefully). It's also a testbed for a handful of technologies, approaches, and workflows that add up to a complete ML lab - one I'd like anyone to be able to pick up and use. The only AI-generated part of this repo is this page (it looked cool, and I'm lazy) (and maybe some UI work later too, i am bad at that stuff)</p>
+    <div class="chip-row">
+      <span class="chip">10 PHASES</span>
+      <span class="chip">LIGHTKURVE · MAST</span>
+      <span class="chip">LINUX HOMESERVER</span>
+      <span class="chip">MLFLOW · GITHUB · DOCKER</span>
+    </div>
+    <div class="progress-block">
+      <div class="label-row">
+        <span>PROGRESS</span>
+        <span><span class="count" id="doneCount">0</span> / <span class="count" id="totalCount">0</span> TASKS DONE</span>
+      </div>
+      <div class="bar-track"><div class="bar-fill" id="overallBar"></div></div>
+    </div>
+  </header>
+
+  <section class="reading">
+    <h2>Read this alongside Phase 0</h2>
+    <p class="note">While you're getting comfortable with the tool, start on these - they'll shape the problem statement you write in Phase 1. Search titles/authors on arXiv or NASA ADS yourself.</p>
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr><th>Year</th><th>Paper</th><th>Why it's on the list</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="year">2018</td>
+            <td class="paper"><strong>Shallue &amp; Vanderburg</strong><span>"Identifying Exoplanets with Deep Learning" (AstroNet)</span></td>
+            <td>The original global+local phase-folded CNN approach almost everyone since has riffed on.</td>
+          </tr>
+          <tr>
+            <td class="year">2019</td>
+            <td class="paper"><strong>Yu et al.</strong><span>AstroNet-Triage</span></td>
+            <td>Adapts the AstroNet idea to TESS full-frame-image scale triage - the closest existing relative of this project.</td>
+          </tr>
+          <tr>
+            <td class="year">2022</td>
+            <td class="paper"><strong>Valizadegan et al.</strong><span>ExoMiner</span></td>
+            <td>Ensemble CNN currently used to help vet real TESS Objects of Interest - a good architecture to study, not necessarily to copy.</td>
+          </tr>
+          <tr>
+            <td class="year">2022</td>
+            <td class="paper"><strong>Malik et al.</strong><span>Machine learning survey for exoplanet detection</span></td>
+            <td>Covers feature-based / classical-ML approaches - useful if you want a non-deep-learning baseline first.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <nav class="phase-nav" id="phaseNav" aria-label="Jump to phase"></nav>
+
+  <main class="timeline" id="timeline"></main>
+
+  <section class="later">
+    <h2>Further down the line</h2>
+    <ul>
+      <li>A small dashboard alongside the friends' kit (Phase 8), so everyone can see what the pipeline and its submitted models have found</li>
+      <li>A write-up once there's a real result worth describing - including "here's what a hobby pipeline gets wrong," which is still a result</li>
+    </ul>
+  </section>
+
+  <footer>
+    <p>Checkboxes save to this browser only (<span class="mono">localStorage</span>) - they won't sync across devices. Treat this as a living document: re-open it as the project moves and edit phases as your own research changes the plan.</p>
+  </footer>
+
+</div>
+
+<script>
+(function () {
+  var phases = [
+    {
+      id: "p0", num: "PHASE 00", title: "Foundations: One Target, End to End", effort: "LIGHT",
+      why: "Get a full download → detrend → fold → search workflow solid on a single star, in Kepler and TESS form, before scaling anything up.",
+      tasks: [
+        "Re-run the existing KIC 8462852 workflow as-is, then repeat it once against a TESS target with search_targetpixelfile(..., sector=N) on any TIC ID - see quarter= and sector= side by side",
+        "Read up on cadence options per mission: Kepler's ~30-min long / ~1-min short cadence vs TESS's 20s/2-min pixel files and 10/30-min FFIs - this decides what a “larger patch” can even mean later",
+        "Compare aperture_mask='pipeline' vs 'all' vs a custom threshold mask in to_lightcurve(), and plot all three light curves on the same axes to see what actually changes",
+        "Call lc.flatten(window_length=...) to detrend, then lc.fold(period=...) and lc.to_periodogram(method='bls') to run a real Box-Least-Squares search - get past “download and look” to “the pipeline found something”",
+        "Add a markdown cell above every code cell explaining what it does and why - this notebook is the reference example everything after it builds on"
+      ],
+      tech: ["Lightkurve", "Kepler", "TESS"]
+    },
+    {
+      id: "p1", num: "PHASE 01", title: "Decide What You're Hunting", effort: "LIGHT · RESEARCH",
+      why: "“Classify stars” is broad - planets, eclipsing binaries, pulsators, flares and instrument artifacts all show up in this data, and the choice changes which catalogs and papers matter.",
+      tasks: [
+        "Read 2–3 papers from the reading list above, and for each one note exactly what input representation they used - raw flux, phase-folded views, or hand-built features",
+        "Write a one-paragraph problem statement: transit detection vs eclipsing binaries vs general variable-star typing vs “flag anything unusual” - pick one to start with",
+        "Name the exact label source for that problem: the NASA Exoplanet Archive's TOI table (TESS) or confirmed-planets table (Kepler/K2), or a catalog like the Villanova Eclipsing Binary Catalog",
+        "Note which archive suits which purpose: Kepler/K2 are finished and heavily labeled (good for a stable baseline), TESS is ongoing and less exhaustively labeled (closer to what the live pipeline will actually face)"
+      ],
+      tech: ["arXiv / ADS", "NASA Exoplanet Archive", "ExoFOP"]
+    },
+    {
+      id: "p2", num: "PHASE 02", title: "Data Dive", effort: "MEDIUM",
+      why: "Get hands-on with real multi-target patches of sky on your laptop before spending any time on server infrastructure - this is what proves the “larger patch” idea is workable at all.",
+      tasks: [
+        "Call search_tesscut('<coords or TIC>', sector=N) to pull a multi-pixel FFI cutout rather than one pre-made target pixel file, and check the resulting TargetPixelFile's shape",
+        "Pick one sector/camera/CCD and cross-reference the TOI table to count how many known objects of interest fall inside that single patch",
+        "Time a real download of 2–3 sectors' worth of cutouts so you have actual MB/GB-per-sector numbers instead of a guess",
+        "Look at astroquery.mast.Observations and the TESScut bulk API as alternatives to per-target lightkurve calls, since a real pipeline shouldn't query star-by-star",
+        "Write a one-page “data budget”: sectors released per month, GB per sector at your chosen cadence, projected TB/year if this runs continuously"
+      ],
+      tech: ["TESScut", "MAST", "astroquery"]
+    },
+    {
+      id: "p3", num: "PHASE 03", title: "Homeserver Build-Out", effort: "MEDIUM",
+      why: "The hands-on Linux half of this project - get the box running reliably before anything unattended depends on it.",
+      tasks: [
+        "Check the old PC's actual specs (RAM, disk size/type, CPU, GPU or none) - this decides whether local deep learning is realistic or whether storage needs an external drive",
+        "Install Ubuntu Server LTS (or your distro of choice) headless, and set up SSH key-based login with password auth disabled",
+        "Set up Tailscale or WireGuard so you can reach the box remotely without opening inbound ports on your router",
+        "Pick systemd services/timers or Docker Compose as your “keep it running” mechanism, and write one paragraph on why you chose it",
+        "Turn on unattended-upgrades, add a disk-space check that alerts you under some free-space threshold, and decide what should happen on an unclean shutdown"
+      ],
+      tech: ["Ubuntu Server", "systemd", "Tailscale"]
+    },
+    {
+      id: "p4", num: "PHASE 04", title: "Data Pipeline &amp; Storage", effort: "HEAVY",
+      why: "Turns “I can download a TPF” into “the machine ingests data on its own” - the plumbing everything else sits on.",
+      tasks: [
+        "Lay out three storage tiers - raw FITS cache, processed/detrended light curves, feature store - and fix a directory structure and naming scheme up front",
+        "Convert processed light curves to Parquet via pandas/pyarrow instead of keeping everything as FITS, so later steps don't re-parse FITS headers every run",
+        "Write an ingestion script that queries MAST for sectors newer than the last one processed, and make it safe to re-run - skip what's already downloaded rather than re-pulling it",
+        "Add structured logging (a per-run log file with timestamps and counts is enough) so a morning check tells you what happened overnight without SSHing in to guess"
+      ],
+      tech: ["Parquet / pyarrow", "systemd timers", "MAST"]
+    },
+    {
+      id: "p5", num: "PHASE 05", title: "Preprocessing &amp; Features", effort: "HEAVY",
+      why: "Raw flux time series aren't ML-ready - this is where most of the actual scientific judgment in the project happens.",
+      tasks: [
+        "Pick one consistent approach to gaps and outliers (e.g. lc.remove_outliers() plus an explicit gap-handling rule) and apply it identically to every light curve",
+        "Decide representation: raw normalized flux windows, phase-folded global+local views (AstroNet-style), or hand-built statistical features via tsfresh for a classical baseline first",
+        "Build a labeled dataset of a few hundred examples by joining Phase 1's catalog labels to processed light curves, and check the class balance before doing anything else",
+        "Split train/val/test by TIC or KIC ID, never by row - otherwise the same star can appear in both training and test data"
+      ],
+      tech: ["NumPy / Pandas", "tsfresh"]
+    },
+    {
+      id: "p6", num: "PHASE 06", title: "Baseline Before Deep Learning", effort: "MEDIUM",
+      why: "A simple, explainable baseline tells you whether the problem is learnable with your labels before any GPU time gets spent.",
+      tasks: [
+        "Train a logistic regression or random forest (scikit-learn) on the hand-built features, and report precision/recall/PR-AUC, not just accuracy - these classes are almost always imbalanced",
+        "Only move to a CNN on folded light-curve views (PyTorch or TensorFlow) if the baseline shows there's learnable signal at all",
+        "Write down, in your own words, what “good enough” means for this hobby project before chasing incremental gains on a metric"
+      ],
+      tech: ["scikit-learn", "PyTorch / TensorFlow"]
+    },
+    {
+      id: "p7", num: "PHASE 07", title: "Tracking &amp; Repo Practices", effort: "MEDIUM",
+      why: "The scaffolding that turns a folder of personal scripts into something you can trust and reproduce months later.",
+      tasks: [
+        "Run an MLflow tracking server on the homeserver (mlflow server --backend-store-uri ...) backed by Postgres or SQLite, reachable over Tailscale",
+        "Decide a run-naming/tagging convention before the first real experiment - mission, sector range, model type, dataset version - retrofitting this later is painful",
+        "Set up the GitHub repo properly: a pinned dependency lockfile, a README stating the current Phase 1 problem statement, and at minimum a lint/test GitHub Action",
+        "Log a dataset version (a manifest file hash is enough) as an MLflow run tag, so any past result is still reproducible months later"
+      ],
+      tech: ["MLflow", "GitHub Actions", "Postgres"]
+    },
+    {
+      id: "p8", num: "PHASE 08", title: "Friends Starter Kit", effort: "MEDIUM",
+      why: "Once there's a baseline and an MLflow server to report to, opening the project up to a couple of friends turns it into a small shared lab - and forcing a clean Docker onboarding path is good practice regardless.",
+      tasks: [
+        "Decide what friends actually get: start with a static exported feature/label dataset (a zipped Parquet file) rather than live access to your raw archive or server filesystem",
+        "Build a template repo - Dockerfile, docker-compose.yml, a starter train.py wired to your feature format, pinned dependencies - so nobody has to fight a Python environment to get started",
+        "Point the template's mlflow.set_tracking_uri() at your homeserver's Tailscale address, and require a --user tag on every run so submissions don't collide",
+        "Cap what a container can use (docker run --cpus/--memory, or a compose deploy.resources block) and put a wall-clock limit on training jobs",
+        "Write a short playbook: how to get the dataset, how to build and run the container, how to submit a run, how it gets scored",
+        "Decide how submissions get judged - compare every submitted model, and your own baseline, against the same held-out set and against the current official catalog"
+      ],
+      tech: ["Docker", "Docker Compose", "MLflow"]
+    },
+    {
+      id: "p9", num: "PHASE 09", title: "Continuous Inference &amp; Validation", effort: "HEAVY",
+      why: "The part where the pipeline looks at new data on its own and hands you candidates worth a second look, instead of you running notebooks by hand.",
+      tasks: [
+        "Schedule inference on newly ingested sectors with a systemd timer that loads the current MLflow-registered model",
+        "Store scored results in SQLite or Postgres instead of flat files, so “show me this week's top candidates” is a query, not a script",
+        "Build a minimal review view (a single Streamlit page is enough) to look at the highest-scoring light curves yourself - keep a human in the loop, since false positives are common",
+        "Keep an ongoing scorecard: every time the official TOI (or relevant) catalog updates, check how many of the pipeline's - and any friends' submitted models' - top candidates match it. This is the real, continuously-updating accuracy number"
+      ],
+      tech: ["Streamlit", "SQLite", "systemd timers"]
+    }
+  ];
+
+  var timeline = document.getElementById("timeline");
+  var nav = document.getElementById("phaseNav");
+  var iconSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12h5l2.5 7L14 5l2 7h6"/></svg>';
+
+  phases.forEach(function (ph, idx) {
+    var card = document.createElement("div");
+    card.className = "phase";
+    card.id = ph.id;
+
+    var tasksHtml = ph.tasks.map(function (t, i) {
+      var cid = ph.id + "-t" + i;
+      return '<li data-cid="' + cid + '"><input type="checkbox" id="' + cid + '"><label for="' + cid + '">' + t + "</label></li>";
+    }).join("");
+
+    var techHtml = ph.tech.map(function (t) { return '<span class="tag">' + t + "</span>"; }).join("");
+
+    card.innerHTML =
+      '<div class="phase-marker">' + iconSvg + "</div>" +
+      '<div class="phase-card">' +
+        '<div class="phase-head">' +
+          "<div>" +
+            '<div class="phase-num">' + ph.num + "</div>" +
+            "<h2>" + ph.title + "</h2>" +
+          "</div>" +
+          '<span class="effort">' + ph.effort + "</span>" +
+        "</div>" +
+        '<p class="why">' + ph.why + "</p>" +
+        '<ul class="tasks">' + tasksHtml + "</ul>" +
+        '<div class="tech-row">' + techHtml + "</div>" +
+        '<div class="phase-mini-bar"><div class="phase-mini-fill" id="' + ph.id + '-bar"></div></div>' +
+      "</div>";
+
+    timeline.appendChild(card);
+
+    var navLink = document.createElement("a");
+    navLink.href = "#" + ph.id;
+    navLink.id = ph.id + "-nav";
+    navLink.innerHTML = '<span class="dot"></span>' + ph.num.replace("PHASE ", "P");
+    nav.appendChild(navLink);
+  });
+
+  var STORAGE_KEY = "tess-starhunter-progress-v1";
+
+  function loadState() {
+    try {
+      return JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
+    } catch (e) {
+      return {};
+    }
+  }
+  function saveState(state) {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    } catch (e) {}
+  }
+
+  var state = loadState();
+  var allBoxes = Array.prototype.slice.call(document.querySelectorAll('.tasks input[type="checkbox"]'));
+
+  allBoxes.forEach(function (box) {
+    if (state[box.id]) {
+      box.checked = true;
+      box.closest("li").classList.add("checked");
+    }
+    box.addEventListener("change", function () {
+      state[box.id] = box.checked;
+      saveState(state);
+      box.closest("li").classList.toggle("checked", box.checked);
+      recompute();
+    });
+  });
+
+  function recompute() {
+    var totalDone = 0, totalAll = 0;
+    phases.forEach(function (ph) {
+      var boxes = ph.tasks.map(function (_, i) { return document.getElementById(ph.id + "-t" + i); });
+      var done = boxes.filter(function (b) { return b.checked; }).length;
+      totalDone += done;
+      totalAll += boxes.length;
+      var pct = boxes.length ? Math.round((done / boxes.length) * 100) : 0;
+      var fill = document.getElementById(ph.id + "-bar");
+      if (fill) fill.style.width = pct + "%";
+      var navLink = document.getElementById(ph.id + "-nav");
+      if (navLink) navLink.classList.toggle("done", pct === 100);
+    });
+    document.getElementById("doneCount").textContent = totalDone;
+    document.getElementById("totalCount").textContent = totalAll;
+    document.getElementById("overallBar").style.width = (totalAll ? (totalDone / totalAll) * 100 : 0) + "%";
+  }
+
+  recompute();
+})();
+</script>
