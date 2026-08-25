@@ -1,0 +1,19 @@
+# Environments
+.venv/
+venv/
+.env
+
+# Python
+__pycache__/
+*.pyc
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Generated notebook outputs (regenerate by re-running the cell)
+*.gif
+*.mp4
+
+# OS cruft
+.DS_Store
+Thumbs.db
