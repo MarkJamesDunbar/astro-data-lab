@@ -1,0 +1,5 @@
+
+CREATE TABLE IF NOT EXISTS tic_objects (
+    tic_id BIGINT PRIMARY KEY,
+    first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
