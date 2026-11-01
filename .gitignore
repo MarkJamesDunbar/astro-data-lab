@@ -17,3 +17,6 @@ __pycache__/
 # OS cruft
 .DS_Store
 Thumbs.db
+
+# Local editor/backup files
+*.bak*

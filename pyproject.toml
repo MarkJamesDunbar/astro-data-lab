@@ -1,19 +1,39 @@
 [project]
 name = "astro-data-lab"
 version = "0.1.0"
-description = "Add your description here"
+description = "Disk-bounded TESS acquisition and full-light-curve classification"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "ipykernel>=7.3.0",
-    "jupyter>=1.1.1",
-    "lightkurve>=2.6.0",
+    "astropy>=6.0",
+    "astroquery>=0.4.7",
+    "mlflow>=3.17.2",
+    "numpy>=2.0",
+    "pandas>=2.2",
     "psycopg[binary]>=3.3.6",
+    "requests>=2.32",
+    "torch==2.6.0",
 ]
 
 [project.scripts]
-astro-data-lab = "astro_data_lab:main"
+astro-data-lab = "astro_data_lab.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.12.17,<0.13.0"]
 build-backend = "uv_build"
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true  # only torch comes from here
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.4.0",
+    "matplotlib>=3.11.2",
+    "nbconvert>=7.17.2",
+    "python-dotenv>=1.2.4",
+]
