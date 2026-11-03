@@ -2,6 +2,7 @@
 import contextlib
 import io
 import os
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -14,7 +15,7 @@ from torch.utils.data import DataLoader
 
 from astro_data_lab import LightCurveDataset, LightCurveUnavailable, pad_collate, read_lightcurve, report, split_of
 from astro_data_lab import lightcurves
-from astro_data_lab.cli import main
+from astro_data_lab.lab import check_status, main, unit_properties
 from astro_data_lab.sync import sync
 
 URI = "mast:TESS/product/tess2019357164649-s0020-0000000367103210-0165-s_lc.fits"
@@ -150,6 +151,80 @@ class Functions(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()) as output:
             main([])
         self.assertIn("sync", output.getvalue())
+
+
+class ScheduleStatus(unittest.TestCase):
+    def setUp(self):
+        self.timer = {
+            "LoadState": "loaded", "ActiveState": "active", "UnitFileState": "enabled",
+            "NextElapseUSecRealtime": "Sun 2026-11-08 03:00:00 GMT",
+            "LastTriggerUSec": "Sun 2026-11-01 03:00:00 GMT",
+        }
+        self.service = {
+            "LoadState": "loaded", "ActiveState": "inactive", "Result": "success",
+            "ExecMainStatus": "0", "ExecMainExitTimestamp": "Sun 2026-11-01 03:05:00 GMT",
+        }
+
+    def status(self):
+        with mock.patch("astro_data_lab.lab.unit_properties", side_effect=lambda name:
+                        self.timer if name.endswith(".timer") else self.service), \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            result = check_status()
+        return result, output.getvalue()
+
+    def test_idle_successful_weekly_jobs_are_healthy(self):
+        healthy, output = self.status()
+        self.assertTrue(healthy)
+        self.assertEqual(output.count(": OK"), 2)
+        self.assertIn("Next run:", output)
+
+    def test_active_sync_is_reported_as_running(self):
+        self.service.update(ActiveState="activating", Result="exit-code", ExecMainStatus="1")
+        healthy, output = self.status()
+        self.assertTrue(healthy)
+        self.assertIn("RUNNING", output)
+
+    def test_disabled_missing_or_unscheduled_timer_is_unhealthy(self):
+        for key, value in (("UnitFileState", "disabled"), ("LoadState", "not-found"),
+                           ("ActiveState", "inactive"), ("NextElapseUSecRealtime", "")):
+            with self.subTest(key=key), mock.patch.dict(self.timer, {key: value}):
+                healthy, output = self.status()
+                self.assertFalse(healthy)
+                self.assertIn("ATTENTION", output)
+
+    def test_failed_or_unrecorded_service_is_unhealthy(self):
+        for key, value in (("Result", "exit-code"), ("ExecMainStatus", "1"),
+                           ("ExecMainExitTimestamp", ""), ("LoadState", "not-found"),
+                           ("ActiveState", "failed")):
+            with self.subTest(key=key), mock.patch.dict(self.service, {key: value}):
+                healthy, _ = self.status()
+                self.assertFalse(healthy)
+
+    def test_status_returns_failure_exit_code(self):
+        with mock.patch("astro_data_lab.lab.check_status", return_value=False), self.assertRaises(SystemExit) as error:
+            main(["status"])
+        self.assertEqual(error.exception.code, 1)
+
+    def test_status_surfaces_systemd_errors(self):
+        for error in (FileNotFoundError("systemctl unavailable"),
+                      subprocess.TimeoutExpired("systemctl", 15),
+                      subprocess.CalledProcessError(1, "systemctl", stderr="No user bus")):
+            with self.subTest(error=type(error).__name__), \
+                 mock.patch("astro_data_lab.lab.check_status", side_effect=error), \
+                 contextlib.redirect_stderr(io.StringIO()) as output, \
+                 self.assertRaises(SystemExit) as raised:
+                main(["status"])
+            self.assertEqual(raised.exception.code, 1)
+            self.assertIn("Cannot check weekly jobs", output.getvalue())
+
+    def test_unit_query_parses_properties_and_checks_errors(self):
+        response = subprocess.CompletedProcess([], 0, stdout="LoadState=loaded\nActiveState=active\n")
+        with mock.patch("astro_data_lab.lab.subprocess.run", return_value=response) as run:
+            self.assertEqual(unit_properties("astro-mast.timer"),
+                             {"LoadState": "loaded", "ActiveState": "active"})
+        self.assertEqual(run.call_args.args[0][:4], ["systemctl", "--user", "show", "astro-mast.timer"])
+        self.assertTrue(run.call_args.kwargs["check"])
+        self.assertEqual(run.call_args.kwargs["timeout"], 15)
 
 
 class ScheduledSync(unittest.TestCase):

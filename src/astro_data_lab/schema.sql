@@ -1,7 +1,7 @@
 -- The complete database. Every statement is idempotent, so astro-data-lab
 -- applies this file automatically; there are no migration scripts to run.
 
--- 1. Planet catalogues (astro-data-lab sync)
+-- 1. Planet catalogues (python -m astro_data_lab.lab sync)
 CREATE TABLE IF NOT EXISTS tic_objects (
     tic_id BIGINT PRIMARY KEY,
     first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()

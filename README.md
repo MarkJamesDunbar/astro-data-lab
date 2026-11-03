@@ -11,9 +11,16 @@ It runs every step on real data in about a minute.
 ## The steps
 
 ```python
-from astro_data_lab import (sync, load_curves, load_tois, load_confirmed_planets,
-                            read_lightcurve, LightCurveDataset, pad_collate, report)
+from astro_data_lab.sync import sync
+from astro_data_lab.tables import load_curves, load_tois, load_confirmed_planets
+from astro_data_lab.lightcurves import read_lightcurve
+from astro_data_lab.dataset import LightCurveDataset, pad_collate
+from astro_data_lab.metrics import report
 ```
+
+Imports name the module that defines each function. For example,
+`astro_data_lab.tables` is `src/astro_data_lab/tables.py`: it reads database
+metadata, while `lightcurves.py` downloads and reads the actual light-curve arrays.
 
 | step | function | input | output |
 |---|---|---|---|
@@ -71,11 +78,13 @@ for x, mask, y in loader:
 1. Python 3.13 and [uv](https://docs.astral.sh/uv/); then `uv sync`.
 2. `cp .env.example .env` and fill it in: PostgreSQL connection, a password file, and
    data folders.
-3. `uv run --env-file .env astro-data-lab sync --max-sectors 30` creates the tables and indexes
+3. From the repository root, `uv run --env-file .env python -m astro_data_lab.lab sync --max-sectors 30` creates the tables and indexes
    sectors (metadata only). Rerun it now and then; finished sectors are skipped.
 4. Optional: an MLflow server (`MLFLOW_TRACKING_URI`) to log your runs.
 
-Other commands: `astro-data-lab cache` shows the cache size. Run the tests with
+The run script is `src/astro_data_lab/lab.py`, called as a Python module rather than
+an installed command. For cache size, run
+`uv run --env-file .env python -m astro_data_lab.lab cache`. Run the tests with
 `uv run python -m unittest discover tests` (no database or network needed).
 
 ### Weekly updates
@@ -84,8 +93,8 @@ The installed user systemd timers run catalogue sync on Sundays at 03:00 and
 manifest sync on Mondays at 03:00 (system local time):
 
 ```sh
-uv run --env-file .env astro-data-lab sync --only catalogues
-uv run --env-file .env astro-data-lab sync --only manifest --max-sectors 2 --refresh-one
+uv run --env-file .env python -m astro_data_lab.lab sync --only catalogues
+uv run --env-file .env python -m astro_data_lab.lab sync --only manifest --max-sectors 2 --refresh-one
 ```
 
 Catalogue sync refreshes TOIs and confirmed planets. Manifest sync indexes up to
@@ -94,6 +103,19 @@ new or changed products. These jobs download metadata, not light-curve payloads.
 The installed units live in `~/.config/systemd/user/`; they are not installed by
 `uv sync`. Check schedules with `systemctl --user list-timers 'astro-*'` and logs
 with `journalctl --user -u astro-catalogues.service -u astro-mast.service`.
+
+Check the installed jobs without starting them:
+
+```sh
+uv run python -m astro_data_lab.lab status
+```
+
+This prints whether each timer is enabled and active, the next scheduled run,
+and the last service completion/result. Idle services are normal between runs.
+It exits with status 1 for disabled/missing schedules, failed runs, missing run
+history, or a systemd query error; 0 means the timers are ready and each service
+is running or last completed successfully. It does not check database contents
+or guarantee that upstream data is current. No database settings are needed.
 
 ## Layout
 
@@ -105,9 +127,9 @@ src/astro_data_lab/
 ├── lightcurves.py   step 3: read_lightcurve, LightCurve, the download cache
 ├── dataset.py       step 4: LightCurveDataset, pad_collate
 ├── metrics.py       step 5: report
+├── lab.py           run sync, cache inspection, or schedule status
 ├── database.py      PostgreSQL connection; applies schema.sql automatically
-├── schema.sql       the whole database: catalogue and manifest tables
-└── cli.py           `astro-data-lab sync` and `astro-data-lab cache`
+└── schema.sql       the whole database: catalogue and manifest tables
 notebooks/getting_started.ipynb   every step on real data
 tests/test_lab.py                 fast checks
 docs/                             GLOSSARY.md (astronomy terms), tmux.md (long runs over SSH)
