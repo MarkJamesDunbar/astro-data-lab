@@ -86,34 +86,3 @@ CREATE TABLE IF NOT EXISTS ingestion_sync_runs (
 );
 CREATE INDEX IF NOT EXISTS idx_ingestion_sync_runs_lookup
     ON ingestion_sync_runs (source, scope, status, finished_at DESC);
-
--- 3. Curves that can never be used (e.g. negative flux); skipped by every run.
-CREATE TABLE IF NOT EXISTS excluded_curves (
-    data_uri TEXT PRIMARY KEY REFERENCES mast_products(data_uri),
-    reason TEXT NOT NULL,
-    excluded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
--- 4. Training: one row per run, one row per curve used in each round.
-CREATE TABLE IF NOT EXISTS training_runs (
-    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    name TEXT NOT NULL UNIQUE,
-    config JSONB NOT NULL,
-    rounds_completed INTEGER NOT NULL DEFAULT 0,
-    checkpoint_path TEXT,
-    best_checkpoint_path TEXT,
-    best_validation_score DOUBLE PRECISION,
-    mlflow_run_id TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS training_examples (
-    run_id BIGINT NOT NULL REFERENCES training_runs(id) ON DELETE CASCADE,
-    round INTEGER NOT NULL,
-    data_uri TEXT NOT NULL REFERENCES mast_products(data_uri),
-    target SMALLINT NOT NULL,
-    injected BOOLEAN NOT NULL DEFAULT FALSE,  -- a synthetic transit was added to this curve
-    PRIMARY KEY (run_id, round, data_uri, injected)
-);
-CREATE INDEX IF NOT EXISTS idx_training_examples_curve ON training_examples(run_id, data_uri);

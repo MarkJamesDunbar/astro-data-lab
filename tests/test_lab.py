@@ -1,329 +1,154 @@
-"""Fast checks (CPU only, no database or network) for the parts that must not break."""
+"""Fast checks (CPU only, no database or network): uv run python -m unittest discover tests"""
 import contextlib
 import io
+import os
 import tempfile
 import unittest
-from pathlib import Path
 from unittest import mock
 
 import numpy as np
+import requests
 import torch
 from astropy.io import fits
+from torch.utils.data import DataLoader
 
+from astro_data_lab import LightCurveDataset, LightCurveUnavailable, pad_collate, read_lightcurve, report, split_of
+from astro_data_lab import lightcurves
 from astro_data_lab.cli import main
-from astro_data_lab.config import Experiment
-from astro_data_lab.data.labels import Curve, balanced_subset, split_of
-from astro_data_lab.data.lightcurves import (
-    MIN_TRANSIT_READINGS, Prepared, UnusableLightCurve, check_quality, clean_fits, collate,
-    detrend, inject_transit, model_input, point_noise, transit_readings,
-)
-from astro_data_lab.models import LightCurveCNN, PatchTransformer, build_model, check_model
-from astro_data_lab.training.evaluation import score
-from astro_data_lab.training.trainer import RoundSampler, train_one_round
 
-ROOT = Path(__file__).resolve().parents[1]
+URI = "mast:TESS/product/tess2019357164649-s0020-0000000367103210-0165-s_lc.fits"
 
 
-def write_fits(path: Path, flux: np.ndarray, quality: int = 0) -> None:
+def fits_bytes(readings: int = 500, tic: int = 367103210, sector: int = 20) -> bytes:
     columns = [
-        fits.Column(name="TIME", format="D", array=np.arange(len(flux)) / 720),
-        fits.Column(name="PDCSAP_FLUX", format="D", array=flux),
-        fits.Column(name="QUALITY", format="J", array=np.full(len(flux), quality)),
+        fits.Column(name="TIME", format="D", array=np.arange(readings) / 720.0),
+        fits.Column(name="PDCSAP_FLUX", format="E", array=np.full(readings, 1000.0)),
+        fits.Column(name="PDCSAP_FLUX_ERR", format="E", array=np.ones(readings)),
+        fits.Column(name="SAP_FLUX", format="E", array=np.full(readings, 990.0)),
+        fits.Column(name="QUALITY", format="J", array=np.zeros(readings, dtype=np.int32)),
     ]
-    fits.HDUList([fits.PrimaryHDU(), fits.BinTableHDU.from_columns(columns, name="LIGHTCURVE")]
-                 ).writeto(path, overwrite=True)
+    header = fits.Header({"TICID": tic, "SECTOR": sector})
+    buffer = io.BytesIO()
+    fits.HDUList([fits.PrimaryHDU(header=header),
+                  fits.BinTableHDU.from_columns(columns, name="LIGHTCURVE")]).writeto(buffer)
+    return buffer.getvalue()
 
 
-def synthetic_curve(transit: bool, rng: np.random.Generator, length: int = 2000) -> torch.Tensor:
-    time = np.arange(length) / 720
-    flux = 1 + rng.normal(0, 1e-3, length)
-    if transit:
-        start = rng.integers(0, length - 60)
-        flux[start:start + 60] -= 0.01
-    return model_input(time, flux)
+class FakeResponse:
+    def __init__(self, content: bytes | None):
+        self.content = content
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+    def raise_for_status(self):
+        if self.content is None:
+            raise requests.HTTPError("503")
+
+    def iter_content(self, _):
+        yield self.content
 
 
-class LabTests(unittest.TestCase):
-    def test_example_configs_load_build_and_typos_are_rejected(self):
-        for path in sorted((ROOT / "experiments").glob("*.toml")):
-            with self.subTest(path=path.name):
-                experiment = Experiment.load(path)
-                if experiment.target == "pretrain":  # no classes; still a valid encoder
-                    self.assertEqual(experiment.classes, ())
-                    build_model(experiment.factory, 1, experiment.options)
-                    continue
-                self.assertEqual(experiment.classes, ("no_signal", "signal"))
-                check_model(build_model(experiment.factory, 2, experiment.options), 2)
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "bad.toml"
-            for text in ('[run]\nname="x"\nlearning_rat=1', '[run]\nname="x"\nrounds="5"',
-                         '[run]\nname="x"\ntarget="planets"', '[oops]\nname="x"',
-                         '[run]\nname="x"\ninjected_fraction=1.0'):
-                path.write_text(text)
-                with self.subTest(text=text), self.assertRaises(ValueError):
-                    Experiment.load(path)
+class CachedDownloads(unittest.TestCase):
+    """read_lightcurve against a temporary cache and a fake network."""
 
-    def test_bad_curves_are_reported_as_unusable_not_crashes(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "curve.fits"
-            for flux, quality, reason in ((np.full(500, -5.0), 0, "median"),
-                                          (np.ones(500), 1, "valid readings"),
-                                          (np.ones(50), 0, "valid readings")):
-                write_fits(path, flux, quality)
-                with self.subTest(reason=reason), self.assertRaisesRegex(UnusableLightCurve, reason):
-                    clean_fits(path)
-            path.write_bytes(b"not a fits file")
-            with self.assertRaisesRegex(UnusableLightCurve, "unreadable"):
-                clean_fits(path)
-            write_fits(path, 1000 + np.random.default_rng(0).normal(0, 1, 500))
-            self.assertEqual(len(clean_fits(path).flux), 500)
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        patches = [mock.patch.dict(os.environ, {"ASTRO_DATA_DIR": self.directory.name, "FREE_SPACE_FLOOR_GIB": "0"}),
+                   mock.patch.object(lightcurves, "_session", None),
+                   mock.patch.object(lightcurves.clock, "sleep")]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.addCleanup(self.directory.cleanup)
 
-    def test_extreme_values_are_clipped_to_safe_inputs(self):
-        flux = np.ones(500)
-        flux[10] = 1e9
-        inputs = model_input(np.arange(500.0), flux)
-        self.assertEqual(inputs.shape, (4, 500))
-        self.assertTrue(torch.isfinite(inputs).all())
-        self.assertLessEqual(inputs.abs().max().item(), 100)
+    def network(self, respond):
+        session = mock.Mock()
+        session.get.side_effect = lambda url, **_: FakeResponse(respond(url))
+        return mock.patch.object(lightcurves.requests, "Session", return_value=session), session
 
-    def test_too_many_bad_curves_stops_but_a_few_are_tolerated(self):
-        good = Prepared([Curve("a", 1, 0)] * 9, [], excluded=1, failed=0)
-        check_quality(good, 10, 0.2, "round")
-        # signals whose transit misses the curve are a labelling outcome, not an outage
-        check_quality(Prepared([Curve("a", 1, 0)] * 5, [], 0, 0, no_transit=5), 10, 0.2, "round")
-        with self.assertRaisesRegex(RuntimeError, "max_bad_fraction"):
-            check_quality(Prepared([Curve("a", 1, 0)] * 5, [], 5, 0), 10, 0.2, "round")
+    def test_returns_raw_arrays_and_caches(self):
+        patch, session = self.network(lambda url: fits_bytes())
+        with patch:
+            lc = read_lightcurve(URI)
+            again = read_lightcurve(URI)
+        self.assertEqual((lc.tic_id, lc.sector, len(lc)), (367103210, 20, 500))
+        self.assertEqual(lc.flux.dtype, np.float32)
+        self.assertTrue(np.array_equal(lc.time, again.time))
+        self.assertEqual(session.get.call_count, 1)  # second read came from the cache
 
-    def test_transit_check_counts_only_readings_inside_predicted_transits(self):
-        time = np.arange(0, 27, 2 / 1440)                         # 27 days, 2-minute cadence
-        hour, minute = 1 / 24, 1 / 1440                            # epochs fall between readings
-        self.assertEqual(transit_readings(time, ((5 + minute, 0.0, 2 * hour),)), 60)   # one 2-h transit
-        self.assertEqual(transit_readings(time, ((5 + minute, 10.0, 2 * hour),)), 180) # days 5, 15, 25
-        self.assertEqual(transit_readings(time, ((-95 + minute, 10.0, 2 * hour),)), 180)  # old epoch
-        self.assertEqual(transit_readings(time, ((40.0, 0.0, 2 * hour),)), 0)          # other sector
-        gap = time[(time < 4.9) | (time > 5.1)]                    # transit fell in a data gap
-        self.assertEqual(transit_readings(gap, ((5 + minute, 0.0, 2 * hour),)), 0)
+    def test_falls_back_from_s3_to_mast(self):
+        patch, session = self.network(lambda url: fits_bytes() if "mast.stsci.edu" in url else None)
+        with patch:
+            read_lightcurve(URI)
+        urls = [call.args[0] for call in session.get.call_args_list]
+        self.assertIn("stpubdata", urls[0])
+        self.assertIn("mast.stsci.edu", urls[1])
 
-    def test_detrending_removes_slow_variability_but_keeps_a_transit(self):
-        time = np.arange(0, 27, 2 / 1440)
-        rng = np.random.default_rng(0)
-        flux = 1 + 0.01 * np.sin(2 * np.pi * time / 5) + rng.normal(0, 2e-4, len(time))
-        dip = (time > 10) & (time < 10 + 3 / 24)                   # 3-hour, 0.2% transit
-        flux[dip] -= 0.002
-        detrended = detrend(time, flux)
-        self.assertLess(np.std(detrended[~dip]), 1e-3)             # the 1% wave is gone
-        self.assertLess(np.median(detrended[dip]), -0.0014)        # >= 70% of the transit depth kept
-        self.assertLess(np.median(model_input(time, flux)[1, dip]), -5)  # many sigma in channel 1
+    def test_unreadable_files_raise_lightcurve_unavailable(self):
+        patch, _ = self.network(lambda url: b"not a fits file")
+        with patch, self.assertRaises(LightCurveUnavailable):
+            read_lightcurve(URI)
 
-    def test_injected_transits_are_visible_realistic_and_reproducible(self):
-        time = np.arange(0, 27, 2 / 1440)
-        flux = 1 + np.random.default_rng(1).normal(0, 1e-3, len(time))
-        for seed in range(20):
-            new_flux, (epoch, period, duration) = inject_transit(time, flux, seed)
-            changed = new_flux < flux
-            self.assertGreaterEqual(changed.sum(), MIN_TRANSIT_READINGS)
-            self.assertGreaterEqual(transit_readings(time, ((epoch, period, duration),)), changed.sum())
-            depth = (1 - new_flux / flux).max()
-            snr = depth / point_noise(flux) * np.sqrt(changed.sum())
-            self.assertTrue(0 < depth <= 0.05 and 4 < snr < 60, (depth, snr))
-            self.assertTrue(np.array_equal(new_flux, inject_transit(time, flux, seed)[0]))
-            self.assertTrue(np.array_equal(new_flux[~changed], flux[~changed]))
+    def test_dataset_skips_unavailable_curves(self):
+        import pandas as pd
 
-    def test_balanced_subset_keeps_order_and_caps_each_class(self):
-        curves = [Curve(str(i), 1, t) for i, t in enumerate([1, 0, 1, 1, 0, 0, 0])]
-        self.assertEqual([c.data_uri for c in balanced_subset(curves, 2)], ["0", "1", "2", "4"])
+        good = "mast:TESS/product/tess2019357164649-s0020-0000000000000001-0165-s_lc.fits"
+        patch, _ = self.network(lambda url: fits_bytes(300) if "0000000000000001" in url else None)
+        table = pd.DataFrame({"data_uri": [good, URI], "label": [1, 0]})
+        dataset = LightCurveDataset(table, lambda lc: lc.flux / 1000 - 1)
+        with patch:
+            x, mask, y = next(iter(DataLoader(dataset, batch_size=2, collate_fn=pad_collate)))
+        self.assertEqual(tuple(x.shape), (1, 1, 300))
+        self.assertEqual(y.tolist(), [1])
+        self.assertEqual(dataset.skipped, 1)
 
-    def test_split_is_by_star_and_roughly_80_10_10(self):
+    def test_cache_deletes_least_recently_used_beyond_its_limit(self):
+        folder = lightcurves.cache_dir()
+        folder.mkdir(parents=True)
+        for i in range(10):
+            path = folder / f"{i}.npz"
+            path.write_bytes(b"x" * 1000)
+            os.utime(path, (i, i))  # file i was last used at time i
+        with mock.patch.dict(os.environ, {"LIGHTCURVE_CACHE_GIB": str(5000 / lightcurves.GIB)}):
+            lightcurves._evict_least_recently_used()
+        self.assertEqual(sorted(p.stem for p in folder.glob("*.npz")), ["6", "7", "8", "9"])
+
+
+class Functions(unittest.TestCase):
+    def test_split_is_fixed_per_star_and_roughly_80_10_10(self):
         splits = [split_of(tic) for tic in range(20_000)]
         self.assertEqual(split_of(12345), split_of(12345))
         for name, share in (("train", 0.8), ("validation", 0.1), ("test", 0.1)):
             self.assertAlmostEqual(splits.count(name) / len(splits), share, delta=0.01)
 
-    def test_model_checker_accepts_the_examples_and_rejects_padding_leaks(self):
-        check_model(LightCurveCNN(num_classes=4), 4)
-        check_model(PatchTransformer(num_classes=2), 2)
-
-        class LeaksPadding(torch.nn.Module):
-            def __init__(self, num_classes):
-                super().__init__()
-                self.head = torch.nn.Linear(3, num_classes)
-
-            def forward(self, inputs):
-                return self.head(inputs[:, :3].mean(-1))  # averages padding zeros too
-
-        with self.assertRaisesRegex(ValueError, "padding"):
-            check_model(LeaksPadding(4), 4)
-
-    def test_padding_never_changes_a_prediction(self):
-        torch.manual_seed(0)
-        model = LightCurveCNN(num_classes=4).eval()
-        rng = np.random.default_rng(1)
-        short, long = synthetic_curve(True, rng, 1237), synthetic_curve(False, rng, 3001)
-        with torch.no_grad():
-            alone = model(short.unsqueeze(0))
-            padded = model(collate([short, long]))[:1]
-        self.assertTrue(torch.allclose(alone, padded, atol=1e-5))
-
-    def test_rounds_are_balanced_and_injected_signals_come_from_fresh_no_signal_curves(self):
-        plan = RoundSampler.__new__(RoundSampler)
-        plan.experiment = Experiment(name="t", curves_per_round=100, injected_fraction=0.4)
-        plan.run_id, plan.streamed, plan.in_flight = 1, {0}, set()
-        plan.pools = {1: [Curve(f"real-{n}", 1, 1, ((1.0, 2.0, 0.1),)) for n in range(30)]}
-        fresh = iter(range(10_000))
-
-        def unseen(_conn, _target, label, _run_id, count, _seed, _skip):
-            return [Curve(f"fresh-{next(fresh)}", 1, label) for _ in range(count)]
-
-        with mock.patch("astro_data_lab.training.trainer.connect"), \
-                mock.patch("astro_data_lab.data.labels.unseen_training_curves", unseen):
-            chosen, streamed = plan.select(1)
-            second, _ = plan.select(2)
-        signals = [c for c in chosen if c.target == 1]
-        no_signals = {c.data_uri for c in chosen if c.target == 0}
-        self.assertEqual(len(signals), 50)
-        self.assertEqual(len(no_signals), 50)
-        self.assertEqual(sum(c.inject for c in signals), 20)                    # 40% of 50
-        # injected signals reuse this round's fresh no_signal curves: no extra downloads
-        self.assertTrue({c.data_uri for c in signals if c.inject} <= no_signals)
-        self.assertEqual({c.data_uri for c in streamed}, no_signals)            # deleted after the round
-        self.assertFalse({c.data_uri for c in streamed} & {c.data_uri for c in second})  # never reused
-
-    def test_example_model_learns_a_transit_from_noise(self):
-        torch.manual_seed(0)
-        rng = np.random.default_rng(0)
-        targets = [i % 2 for i in range(256)]
-        data = Prepared([Curve(str(i), 1, t) for i, t in enumerate(targets)],
-                        [synthetic_curve(bool(t), rng) for t in targets], 0, 0)
-        model = LightCurveCNN(num_classes=2, width=16)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=3e-3)
-        losses = [train_one_round(model, optimizer, data, 32, torch.device("cpu"), seed)[0]
-                  for seed in range(6)]
-        held_out = [synthetic_curve(bool(i % 2), rng) for i in range(100)]
-        with torch.no_grad():
-            probabilities = model.eval()(collate(held_out)).softmax(-1).numpy()
-        report = score(np.array([i % 2 for i in range(100)]), probabilities, ("none", "transit"))
-        self.assertLess(losses[-1], losses[0])
-        self.assertTrue(report.better_than_chance, report.text())
-
-    def test_metrics_match_a_known_confusion_matrix(self):
-        targets = np.array([0, 0, 0, 0, 1, 1])
-        predictions = np.eye(2)[[0, 0, 0, 1, 1, 1]]
-        report = score(targets, predictions, ("a", "b"))
-        self.assertAlmostEqual(report.balanced_accuracy, (0.75 + 1.0) / 2)
-        self.assertEqual(report.confusion.tolist(), [[3, 1], [0, 2]])
-        self.assertFalse(score(targets, np.tile([1.0, 0.0], (6, 1)), ("a", "b")).better_than_chance)
-
-    def test_downloads_try_the_public_s3_copy_before_mast(self):
-        from astro_data_lab.data.lightcurves import DOWNLOAD_URL, download_urls
-
-        uri = "mast:TESS/product/tess2019357164649-s0020-0000000367103210-0165-s_lc.fits"
-        (s3, _), (mast, params) = download_urls(uri)
+    def test_s3_url_is_built_from_the_file_name(self):
+        (s3, _), (mast, params) = lightcurves.download_urls(URI)
         self.assertEqual(s3, "https://stpubdata.s3.us-east-1.amazonaws.com/tess/public/tid/s0020/"
                              "0000/0003/6710/3210/tess2019357164649-s0020-0000000367103210-0165-s_lc.fits")
-        self.assertEqual((mast, params), (DOWNLOAD_URL, {"uri": uri}))
-        self.assertEqual(download_urls("mast:TESS/product/unexpected.fits"),
-                         [(DOWNLOAD_URL, {"uri": "mast:TESS/product/unexpected.fits"})])
+        self.assertEqual((mast, params), (lightcurves.MAST_URL, {"uri": URI}))
 
-    def test_predicted_transit_times_inside_a_curve(self):
-        from astro_data_lab.data.lightcurves import transit_centres
+    def test_pad_collate_pads_and_masks(self):
+        x, mask, y = pad_collate([(torch.ones(3), 0), None, (torch.ones(5), 1)])  # None = unavailable curve
+        self.assertEqual(tuple(x.shape), (2, 1, 5))
+        self.assertEqual(mask.sum(1).tolist(), [3, 5])
+        self.assertEqual(x[0, 0, 3:].tolist(), [0.0, 0.0])
+        self.assertEqual(y.dtype, torch.long)
 
-        time = np.linspace(100.0, 127.0, 5000)
-        centres = transit_centres(time, ((101.5, 5.0, 0.1), (200.0, 0.0, 0.1), (110.0, 0.0, 0.1)))
-        self.assertEqual(centres.tolist(), [101.5, 106.5, 110.0, 111.5, 116.5, 121.5, 126.5])
+    def test_report_matches_a_known_confusion_matrix(self):
+        result = report([0, 0, 0, 0, 1, 1], [0, 0, 0, 1, 1, 1], ["a", "b"])
+        self.assertAlmostEqual(result.balanced_accuracy, (0.75 + 1.0) / 2)
+        self.assertEqual(result.confusion.tolist(), [[3, 1], [0, 2]])
+        self.assertIn("balanced accuracy", str(result))
+        self.assertLess(report([0, 0, 1, 1], [0, 0, 0, 0]).ci95[0], 0.5 + 1e-9)  # always "0" is chance
 
-    def test_download_falls_back_to_mast_when_s3_fails(self):
-        from unittest import mock
-
-        import requests
-
-        from astro_data_lab.data import lightcurves
-
-        class Response:
-            def __init__(self, ok):
-                self.ok = ok
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_):
-                return False
-
-            def raise_for_status(self):
-                if not self.ok:
-                    raise requests.HTTPError("503")
-
-            def iter_content(self, _):
-                yield b"x" * 10
-
-        session = mock.Mock()
-        session.get.side_effect = lambda url, **_: Response("mast.stsci.edu" in url)
-        uri = "mast:TESS/product/tess2019357164649-s0020-0000000367103210-0165-s_lc.fits"
-        with tempfile.TemporaryDirectory() as directory, mock.patch.object(lightcurves.time, "sleep"):
-            path = lightcurves.download_fits(session, uri, 10, Path(directory) / "x.fits")
-            self.assertEqual(path.read_bytes(), b"x" * 10)
-        self.assertIn("stpubdata", session.get.call_args_list[0].args[0])
-        self.assertIn("mast.stsci.edu", session.get.call_args_list[1].args[0])
-
-    def test_interpolation_baseline_averages_nearest_visible_patches(self):
-        from astro_data_lab.models.foundation import _neighbour_estimate
-
-        means = torch.tensor([1.0, 9.0, 3.0, 9.0, 9.0, 7.0])           # per-patch level
-        features = means.view(1, 6, 1, 1).expand(1, 6, 3, 4).clone()
-        valid = torch.ones(1, 6, 4, dtype=torch.bool)
-        hidden = torch.tensor([[False, True, False, True, True, False]])
-        estimate = _neighbour_estimate(features, valid, hidden)[0, :, 0, 0]
-        self.assertEqual(estimate[[1, 3, 4]].tolist(), [2.0, 5.0, 5.0])  # (1+3)/2, (3+7)/2, (3+7)/2
-
-    def test_pretraining_updates_the_encoder_and_transfers_to_a_classifier(self):
-        from astro_data_lab.data.lightcurves import INPUT_VERSION
-        from astro_data_lab.models import MaskedPatchPretrainer, PatchTransformer
-        from astro_data_lab.training.trainer import _initialise_from, pretrain_one_round
-
-        torch.manual_seed(0)
-        rng = np.random.default_rng(0)
-        data = Prepared([Curve(str(i), 1, -1) for i in range(16)],
-                        [synthetic_curve(bool(i % 2), rng) for i in range(16)], 0, 0)
-        options = {"width": 32, "depth": 2, "heads": 4}
-        model = MaskedPatchPretrainer(**options)
-        before = {k: v.clone() for k, v in model.state_dict().items()}
-        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-        loss, baseline, steps, skipped = pretrain_one_round(model, optimizer, data, 8, torch.device("cpu"), 0)
-        self.assertTrue(np.isfinite(loss) and np.isfinite(baseline) and steps == 2 and skipped == 0)
-        self.assertFalse(torch.equal(before["encoder.layers.0.linear1.weight"], model.encoder.layers[0].linear1.weight))
-        self.assertTrue(torch.equal(before["head.weight"], model.head.weight))  # head is not pre-trained
-
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "best.pt"
-            torch.save({"model": model.state_dict(), "round": 1, "input_version": INPUT_VERSION}, path)
-            classifier = PatchTransformer(num_classes=2, **options)
-            _initialise_from(classifier, str(path), torch.device("cpu"))
-        self.assertTrue(torch.equal(classifier.encoder.layers[1].linear2.weight, model.encoder.layers[1].linear2.weight))
-        self.assertTrue(torch.equal(classifier.embed.weight, model.embed.weight))
-        check_model(classifier, 2)
-
-    def test_pretrain_experiments_have_no_classes(self):
-        experiment = Experiment(name="p", target="pretrain")
-        self.assertEqual(experiment.classes, ())
-        self.assertEqual(Experiment.load(ROOT / "experiments" / "foundation_pretrain.toml").target, "pretrain")
-
-    def test_injection_with_fixed_snr_is_reproducible_and_scales_depth(self):
-        from astro_data_lab.data.lightcurves import inject_transit, point_noise
-
-        rng = np.random.default_rng(3)
-        time = np.arange(18000) / 720.0
-        flux = 1 + rng.normal(0, 1e-3, 18000)
-        weak, _ = inject_transit(time, flux, seed=11, snr=10)
-        strong, _ = inject_transit(time, flux, seed=11, snr=40)
-        self.assertTrue(np.array_equal(inject_transit(time, flux, seed=11)[0], inject_transit(time, flux, seed=11)[0]))
-        self.assertAlmostEqual((flux - strong).max() / (flux - weak).max(), 4.0, places=6)
-        self.assertGreater((flux - weak).max(), 3 * point_noise(flux) / np.sqrt(1000))
-
-    def test_help_needs_no_database_or_gpu(self):
-        output = io.StringIO()
-        with contextlib.redirect_stdout(output):
+    def test_help_needs_no_database(self):
+        with contextlib.redirect_stdout(io.StringIO()) as output:
             main([])
-        for command in ("sync", "train", "evaluate", "predict"):
-            self.assertIn(command, output.getvalue())
+        self.assertIn("sync", output.getvalue())
 
 
 if __name__ == "__main__":

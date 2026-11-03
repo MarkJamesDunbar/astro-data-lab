@@ -1,12 +1,10 @@
-"""Step 1b: index which TESS SPOC light-curve files exist at MAST (the manifest).
+"""Index which TESS SPOC light-curve files exist at MAST (the manifest).
 
 Records metadata only (URI, star, sector, size); never downloads FITS files.
 Completed sectors are skipped, so repeated syncs only fetch new sectors.
 """
 
-import argparse
 import fcntl
-import os
 import re
 import time
 from contextlib import contextmanager
@@ -442,86 +440,3 @@ def sync_incremental(directory: Path, start_sector: int, max_sectors: int, refre
             sync_sector(older_sector, directory, 1, 1)
 
     print(f"Incremental MAST sync complete: {ingested} new sector(s) inventoried.", flush=True)
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--start-sector", type=int, default=1)
-    parser.add_argument("--end-sector", type=int, default=26)
-    parser.add_argument("--sector", type=int, help="Scan one specific sector")
-    parser.add_argument("--refresh", action="store_true", help="Rescan completed sectors")
-    parser.add_argument(
-        "--incremental", action="store_true",
-        help="Inventory next unindexed sector(s), stop when MAST has no next sector",
-    )
-    parser.add_argument(
-        "--max-sectors-per-run", type=int, default=2,
-        help="Maximum new sectors per --incremental run (default: 2)",
-    )
-    parser.add_argument(
-        "--refresh-one", action="store_true",
-        help="Alongside incremental discovery, rescan the least recently completed sector",
-    )
-    parser.add_argument("--cleanup-stale", action="store_true", help="Clean interrupted staging files only")
-    args = parser.parse_args()
-
-    if args.incremental and (args.sector is not None or args.refresh or args.cleanup_stale):
-        parser.error("--incremental cannot be combined with --sector, --refresh or --cleanup-stale")
-    if args.refresh_one and not args.incremental:
-        parser.error("--refresh-one requires --incremental")
-    if args.max_sectors_per_run < 1:
-        parser.error("--max-sectors-per-run must be positive")
-
-    first = last = args.sector if args.sector is not None else None
-    if first is None:
-        first, last = args.start_sector, args.end_sector
-    if first < 1 or (not args.incremental and last < first):
-        parser.error("Sector numbers must be positive and end >= start")
-
-    directory = Path(os.environ["MAST_INVENTORY_DIR"])
-    with inventory_lock(directory):
-        if args.cleanup_stale:
-            cleanup_stale(directory)
-            return
-        if args.incremental:
-            sync_incremental(directory, first, args.max_sectors_per_run, args.refresh_one)
-            return
-
-        started = time.monotonic()
-        done = skipped = succeeded = 0
-        failures = []
-        total = last - first + 1
-        for ordinal, sector in enumerate(range(first, last + 1), 1):
-            try:
-                if not args.refresh and completed_before(sector):
-                    skipped += 1
-                    print(f"\n[{ordinal}/{total}] Sector {sector:02d}: SKIPPED (completed before)", flush=True)
-                else:
-                    sync_sector(sector, directory, ordinal, total)
-                    succeeded += 1
-            except KeyboardInterrupt:
-                print(
-                    f"\nCancelled. {done}/{total} sectors finished in "
-                    f"{duration(time.monotonic() - started)}. "
-                    "Rerun to resume from incomplete sectors.",
-                    flush=True,
-                )
-                raise SystemExit(130)
-            except Exception as error:
-                failures.append(sector)
-                print(f"Continuing after Sector {sector:02d}: {error}", flush=True)
-            done += 1
-            print(
-                f"OVERALL {progress(done, total)} | {done}/{total} visited | "
-                f"{succeeded} completed, {skipped} skipped, "
-                f"{len(failures)} failed | elapsed {duration(time.monotonic() - started)}",
-                flush=True,
-            )
-
-    if failures:
-        raise SystemExit(f"Failed sectors {failures}. Rerun to retry those sectors.")
-    print("\nAll requested sectors have been inventoried successfully.", flush=True)
-
-
-if __name__ == "__main__":
-    main()

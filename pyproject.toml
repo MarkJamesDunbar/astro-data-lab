@@ -1,7 +1,7 @@
 [project]
 name = "astro-data-lab"
 version = "0.1.0"
-description = "Disk-bounded TESS acquisition and full-light-curve classification"
+description = "Plain Python functions for training models on TESS light curves"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [

@@ -1,9 +1,7 @@
-"""Step 1a: download the NASA planet catalogues (confirmed planets and TOIs).
+"""Download the NASA planet catalogues: confirmed planets, and TESS Objects of Interest (TOIs).
 
-These provide the labels; each TOI's transit timing (epoch, period, duration)
-lets us check whether a transit falls inside a particular light curve. Each download is snapshotted to
-CATALOGUE_SNAPSHOT_DIR and every changed record is logged in
-`catalogue_change_events`.
+Each download is snapshotted to CATALOGUE_SNAPSHOT_DIR, and every changed record is
+logged in `catalogue_change_events`.
 """
 
 from __future__ import annotations
