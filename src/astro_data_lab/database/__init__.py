@@ -27,3 +27,16 @@ def ensure_schema() -> None:
     with connect() as conn:
         conn.execute("SELECT pg_advisory_xact_lock(hashtext('astro_data_lab_schema'))")
         conn.execute(schema)
+
+
+def refresh_statistics() -> None:
+    """Update PostgreSQL's row-count estimates for the tables training queries depend on.
+
+    Bulk inserts (a sync, or a long run's `training_examples`) can leave the query
+    planner thinking a table is empty; it then picks plans that rescan a run's whole
+    history once per curve, and each round waits longer. Takes a few seconds.
+    """
+    with connect() as conn:
+        for table in ("mast_products", "tess_objects_of_interest", "confirmed_planets",
+                      "excluded_curves", "training_examples"):
+            conn.execute(f"ANALYZE {table}")

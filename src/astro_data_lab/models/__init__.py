@@ -3,9 +3,10 @@
     model = Factory(num_classes=N, **options)          # returns an nn.Module
     logits = model(inputs)   # inputs (batch, 4, readings) -> logits (batch, N)
 
-Two examples are included: `LightCurveCNN` (cnn.py) and `PatchTransformer`
-(transformer.py). Put new models in this folder, export them below, and point
-an experiment at them: factory = "astro_data_lab.models:YourModel".
+Included: `LightCurveCNN` (cnn.py), `PatchTransformer` (transformer.py), and
+`MaskedPatchPretrainer` (foundation.py), which pre-trains a PatchTransformer
+without labels. Put new models in this folder, export them below, and point an
+experiment at them: factory = "astro_data_lab.models:YourModel".
 """
 from __future__ import annotations
 
@@ -15,9 +16,11 @@ from typing import Any
 from torch import nn
 
 from astro_data_lab.models.cnn import LightCurveCNN, MaskedConvBlock
+from astro_data_lab.models.foundation import MaskedPatchPretrainer
 from astro_data_lab.models.transformer import PatchTransformer
 
-__all__ = ["LightCurveCNN", "MaskedConvBlock", "PatchTransformer", "build_model", "check_model"]
+__all__ = ["LightCurveCNN", "MaskedConvBlock", "MaskedPatchPretrainer", "PatchTransformer", "build_model",
+           "check_model"]
 
 
 def build_model(factory: str, num_classes: int, options: dict[str, Any]) -> nn.Module:

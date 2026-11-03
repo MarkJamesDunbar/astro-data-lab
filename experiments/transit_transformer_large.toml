@@ -1,0 +1,30 @@
+# Control for transit_foundation.toml: the same 15M-parameter Transformer and settings,
+# trained from random weights. If the foundation run does not beat this, pre-training
+# did not help.
+
+[run]
+name = "transit-transformer-large-v1"
+target = "transit"
+
+[data]
+curves_per_round = 1024
+injected_fraction = 0.5
+rounds = 100
+validation_curves_per_class = 300
+download_workers = 16
+
+[training]
+passes_per_round = 3
+minibatch_size = 32
+learning_rate = 0.0001
+weight_decay = 0.0001
+
+[model]
+factory = "astro_data_lab.models:PatchTransformer"
+
+[model.options]
+patch = 64
+width = 384
+depth = 8
+heads = 8
+dropout = 0.1

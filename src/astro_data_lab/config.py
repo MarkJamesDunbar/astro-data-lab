@@ -15,6 +15,7 @@ TARGETS: dict[str, tuple[str, ...]] = {
     # Class names in model-output order. See data/labels.py for how curves are labelled.
     "transit": ("no_signal", "signal"),
 }
+PRETRAIN = "pretrain"  # self-supervised target: no labels, see models/foundation.py
 
 
 @dataclass(frozen=True)
@@ -68,12 +69,13 @@ class Experiment:
     # [model]
     factory: str = "astro_data_lab.models:LightCurveCNN"
     options: dict[str, Any] = field(default_factory=dict)
+    init_from: str = ""              # start from another run's best weights (run name or checkpoint path)
 
     def __post_init__(self) -> None:
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", self.name):
             raise ValueError("name may contain only letters, digits, dot, underscore and hyphen")
-        if self.target not in TARGETS:
-            raise ValueError(f"target must be one of {', '.join(TARGETS)}")
+        if self.target not in TARGETS and self.target != PRETRAIN:
+            raise ValueError(f"target must be one of {', '.join([*TARGETS, PRETRAIN])}")
         if self.curves_per_round < len(self.classes) or self.minibatch_size < 1 or self.passes_per_round < 1:
             raise ValueError("curves_per_round, minibatch_size and passes_per_round are too small")
         if self.rounds < 0 or self.validation_curves_per_class < 1 or self.download_workers < 1:
@@ -87,7 +89,8 @@ class Experiment:
 
     @property
     def classes(self) -> tuple[str, ...]:
-        return TARGETS[self.target]
+        """Class names in model-output order; empty for self-supervised pre-training."""
+        return TARGETS.get(self.target, ())
 
     def to_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)

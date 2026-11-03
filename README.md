@@ -206,7 +206,10 @@ astro-data-lab/
 ├── .env.example                  template for machine settings (copy to .env)
 ├── experiments/
 │   ├── transit_cnn.toml          CNN experiment
-│   └── transit_transformer.toml  same data and task, Transformer model
+│   ├── transit_transformer.toml  same data and task, small Transformer
+│   ├── foundation_pretrain.toml  foundation model, stage 1: self-supervised pre-training
+│   ├── transit_foundation.toml   foundation model, stage 2: fine-tune on transits
+│   └── transit_transformer_large.toml  control: the same large Transformer, no pre-training
 ├── notebooks/
 │   └── walkthrough.ipynb         the whole platform on real data, step by step
 ├── src/astro_data_lab/
@@ -221,7 +224,8 @@ astro-data-lab/
 │   ├── models/
 │   │   ├── __init__.py           the model contract, build_model, check_model
 │   │   ├── cnn.py                LightCurveCNN
-│   │   └── transformer.py        PatchTransformer
+│   │   ├── transformer.py        PatchTransformer
+│   │   └── foundation.py         MaskedPatchPretrainer (pre-trains a PatchTransformer without labels)
 │   ├── training/
 │   │   ├── trainer.py            step 5: rounds, streaming, checkpoints, MLflow
 │   │   └── evaluation.py         step 6: metrics, confusion matrix, confidence interval
@@ -231,6 +235,7 @@ astro-data-lab/
 ├── tests/
 │   └── test_lab.py               fast CPU-only tests, no database or network
 └── docs/
+    ├── paper/                    working paper on the results (paper.md), and make_figures.py to rebuild it
     ├── GLOSSARY.md               astronomy terms (TESS, TIC, TOI, SPOC, ...)
     └── tmux.md                   keeping long runs alive over SSH
 ```
@@ -417,7 +422,7 @@ Every setting, with its default:
 | setting | default | meaning |
 |---|---|---|
 | `name` | required | letters, digits, `.`, `_`, `-` |
-| `target` | `transit` | what to predict; currently the only target (see [Extending](#13-extending-the-lab)) |
+| `target` | `transit` | `transit` (classify), or `pretrain` (self-supervised, no labels; see [section 8](#8-choosing-an-architecture-and-foundation-models)) |
 | `curves_per_round` | `1024` | curves per round: half signal, half no_signal |
 | `injected_fraction` | `0.5` | share of signal examples that are synthetic, in [0, 1) |
 | `rounds` | `30` | total rounds; `0` = until stopped |
@@ -431,6 +436,7 @@ Every setting, with its default:
 | `seed` | `42` | controls sampling, shuffling and initialisation |
 | `factory` | `astro_data_lab.models:LightCurveCNN` | `module:Callable` that builds the model |
 | `options` (`[model.options]`) | `{}` | keyword arguments passed to the factory |
+| `init_from` | `""` | start from another run's best weights: a run name or a checkpoint path. Every weight whose name and shape match is copied; the rest start fresh. Used only when a run starts, not on resume |
 
 Unknown keys and wrong types, such as `rounds = "5"`, are rejected with a clear
 message. The section names are for readability only: any setting may appear in any
@@ -493,6 +499,11 @@ Options: `patch` (64), `width` (64), `depth` (4), `heads` (4), `dropout` (0.1),
 
 Both take under 70 ms per training step for 32 curves of 18,000 readings on a 6 GB
 RTX 2060. Neither comes close to the GPU's memory.
+
+**`MaskedPatchPretrainer`** (`models/foundation.py`): a `PatchTransformer` plus a
+`hidden_token` and a small `decoder`, used only to pre-train (see section 8). Extra
+option: `mask_fraction` (0.4). Its encoder weights carry the same names as a
+`PatchTransformer`'s, so `init_from` transfers them directly.
 
 ### Adding a model to the package
 
@@ -557,15 +568,27 @@ runs; the walkthrough uses this.
 
 ### Building blocks for notebooks
 
-```python
-from astro_data_lab.config import Experiment, Settings
-from astro_data_lab.data import labels                          # class_counts, fixed_sample
-from astro_data_lab.data.lightcurves import prepare_many, collate, model_input, inject_transit
-from astro_data_lab.models import check_model
-from astro_data_lab.training.trainer import train, status, train_one_round
-from astro_data_lab.training.evaluation import evaluate, evaluate_curves
-from astro_data_lab.predict import predict, load_trained
-```
+Everything the command line does is a plain Python function, so a notebook can do the
+same work. The walkthrough uses each of these; none of it is reimplemented there.
+
+| task | function |
+|---|---|
+| settings from `.env`, an experiment in code | `config.Settings.from_env()`, `config.Experiment(...)` |
+| how many usable curves per class and split | `data.labels.summary(conn)` |
+| the same curves every time, per split | `data.labels.fixed_sample(conn, target, split, per_class)` |
+| download, clean, check labels, build model input | `data.lightcurves.prepare_many(curves, settings, workers)` |
+| a prepared curve's cleaned time and flux | `data.lightcurves.curve_arrays(curve, settings)` |
+| predicted transit times inside a curve | `data.lightcurves.transit_centres(time, curve.ephemerides)` |
+| detrending, model input, synthetic transits | `detrend`, `model_input`, `inject_transit` (same module) |
+| download one raw FITS file | `data.lightcurves.download_fits(session, uri, size, path)` |
+| check a model obeys the contract | `models.check_model(model, num_classes)` |
+| train or resume a run | `training.trainer.train(experiment, settings)` |
+| one round of gradient descent on your own data | `training.trainer.train_one_round(...)` |
+| progress, per-round metrics, forget a run | `training.trainer.status`, `.history`, `.delete_run` |
+| score on held-out stars | `training.evaluation.evaluate(name, settings, split)` |
+| classify one FITS file | `predict.predict(checkpoint, fits_path)` |
+
+All of these live under `astro_data_lab.`, e.g. `from astro_data_lab.data import labels`.
 
 Open notebooks in VS Code with the project's `.venv` as the kernel, or run
 `uv run --with jupyterlab jupyter lab`. They load `.env` themselves.
@@ -615,22 +638,57 @@ good at *planet vs false positive* for an existing detection. They answer a
 different question, because they need the period first. Classic searches such as
 Box Least Squares find the period without any machine learning.
 
-**A light-curve foundation model** would pre-train an encoder, such as
-`PatchTransformer`'s, on the ~430,000 unlabelled curves using self-supervision.
-The usual method is to hide random patches and train the model to reconstruct
-them. That encoder is then fine-tuned on this labelled task. Published examples
-include Astromer, a Transformer pre-trained on light curves. It fits this
-platform naturally: the streaming pipeline already feeds unlabelled curves through
-a bounded cache, and the evaluation above measures whether pre-training helped.
-Two things to know before starting:
+### The foundation model
 
-- **It is bandwidth-bound.** One pass over all unlabelled curves is about 860 GB of
-  FITS downloads: roughly 5 hours at 50 MB/s, or 5 days at 2 MB/s.
-- **It pays off when labels are scarce** relative to unlabelled data, which is the
-  case here. It cannot fix wrong labels.
+The labelled task has about 4,400 real transit curves, but the training split holds
+**438,704 curves** in total. A foundation model learns from all of them without
+labels, then is fine-tuned on the labelled task. This lab does that in two stages.
 
-It is not built yet. The natural shape is an `astro-data-lab pretrain` command that
-saves encoder weights, plus a `pretrained = "path"` model option for fine-tuning.
+**Stage 1: self-supervised pre-training** (`experiments/foundation_pretrain.toml`,
+`target = "pretrain"`). Every round streams 2,048 training-split curves the run has
+never used, of any kind, and deletes them afterwards. For each curve,
+`MaskedPatchPretrainer` hides 40% of its ~2-hour patches and learns to predict their
+readings (raw and detrended flux) from the rest. This is the same idea as BERT,
+MAE and Astromer. Filling a hidden patch well needs an understanding of stellar
+variability, noise, gaps and recurring dips, which is what transit detection needs
+too. One pass over all 438,704 curves is ~830 GB of downloads, about 12 hours at
+~10 curves/s. `rounds = 0` means until every training-split curve has been used once.
+
+The model is 15M parameters (width 384, 8 layers, 8 heads), 44 times the small
+Transformer. Each round runs 3 passes with fresh random masks.
+
+Two numbers are logged per round, both on the fixed validation stars:
+
+| metric | meaning |
+|---|---|
+| `validation_reconstruction_skill` | `1 − masked loss ÷ interpolation loss`. The interpolation baseline predicts each hidden patch as the average of its nearest visible neighbours. 0 = no better than that, 1 = perfect, negative = worse. `best.pt` is the round with the highest skill |
+| `validation_probe_balanced_accuracy` | a logistic regression on the frozen encoder's curve embeddings, predicting transit vs no transit, scored by 5-fold cross-validation. It measures how much transit information the encoder learned **without ever being told about transits**. Round 0 logs the untrained encoder for comparison |
+
+**Stage 2: fine-tuning** (`experiments/transit_foundation.toml`). An ordinary
+`PatchTransformer` experiment with the same options and
+`init_from = "foundation-v1"`, which copies every encoder weight from the
+pre-training run's `best.pt`. Only the 2-class head starts from random weights.
+
+**The control** (`experiments/transit_transformer_large.toml`) is identical except
+for `init_from`. **Pre-training helped only if the fine-tuned run's test score beats
+the control's.**
+
+Run all three in order:
+
+```bash
+uv run --env-file .env astro-data-lab train experiments/foundation_pretrain.toml
+uv run --env-file .env astro-data-lab train experiments/transit_foundation.toml
+uv run --env-file .env astro-data-lab evaluate experiments/transit_foundation.toml
+uv run --env-file .env astro-data-lab train experiments/transit_transformer_large.toml
+uv run --env-file .env astro-data-lab evaluate experiments/transit_transformer_large.toml
+```
+
+Stopping pre-training early (Ctrl+C or `kill`) is fine: fine-tuning uses the best
+checkpoint so far. `evaluate` refuses a pre-training run, because there is nothing
+to classify yet; evaluate the fine-tuned run instead.
+
+To pre-train a different encoder, subclass it the same way: add the extra
+pre-training parts, and keep the shared weights named as in the classifier.
 
 ---
 
@@ -784,8 +842,14 @@ SELECT round, COUNT(*) FILTER (WHERE target = 1 AND NOT injected) AS real_signal
 FROM training_examples e JOIN training_runs r ON r.id = e.run_id
 WHERE r.name = 'transit-cnn-v1' GROUP BY round ORDER BY round;
 
--- forget a run completely (also delete its checkpoint folder)
-DELETE FROM training_runs WHERE name = 'my-broken-run';   -- cascades to training_examples
+```
+
+To forget a run completely (database records and checkpoints; MLflow keeps its history):
+
+```python
+from astro_data_lab.config import Settings
+from astro_data_lab.training.trainer import delete_run
+delete_run("my-broken-run", Settings.from_env())
 ```
 
 ---

@@ -135,6 +135,18 @@ def model_input(time_: np.ndarray, flux: np.ndarray) -> torch.Tensor:
     return torch.from_numpy(features.astype(np.float32))
 
 
+def transit_centres(time_: np.ndarray, ephemerides: tuple[tuple[float, float, float], ...]) -> np.ndarray:
+    """Predicted transit mid-times (BTJD) that fall within this curve's time span."""
+    centres = []
+    for epoch, period, _ in ephemerides:
+        if period > 0:
+            first, last = np.ceil((time_[0] - epoch) / period), np.floor((time_[-1] - epoch) / period)
+            centres.extend(epoch + period * np.arange(first, last + 1))
+        elif time_[0] <= epoch <= time_[-1]:
+            centres.append(epoch)
+    return np.sort(np.asarray(centres, dtype=np.float64))
+
+
 def transit_readings(time_: np.ndarray, ephemerides: tuple[tuple[float, float, float], ...]) -> int:
     """How many readings fall inside a predicted transit (epoch BTJD, period days, duration days).
 
@@ -149,14 +161,15 @@ def transit_readings(time_: np.ndarray, ephemerides: tuple[tuple[float, float, f
     return int(inside.sum())
 
 
-def inject_transit(time_: np.ndarray, flux: np.ndarray, seed: int
+def inject_transit(time_: np.ndarray, flux: np.ndarray, seed: int, snr: float | None = None
                    ) -> tuple[np.ndarray, tuple[float, float, float]] | None:
     """Add a synthetic periodic transit that is detectable but not obvious.
 
     Period 0.5-15 days (log-uniform), duration 1-8 hours, trapezoid shape, and a
     depth chosen so the total signal-to-noise is 8-40 (TESS flags candidates
     from about 7). Returns the new flux and (epoch, period, duration), or None
-    if no placement puts enough readings in transit.
+    if no placement puts enough readings in transit. A fixed `snr` replaces the
+    random 8-40 draw (used to measure detection rate against signal strength).
     """
     rng = np.random.default_rng(seed)
     noise = point_noise(flux)
@@ -168,7 +181,7 @@ def inject_transit(time_: np.ndarray, flux: np.ndarray, seed: int
         shape = np.clip((1 - np.abs(offset) / (duration / 2)) / 0.3, 0, 1)  # flat bottom, sloped edges
         readings = int(np.count_nonzero(shape))
         if readings >= MIN_TRANSIT_READINGS:
-            depth = min(rng.uniform(8, 40) * noise / np.sqrt(readings), 0.05)
+            depth = min((rng.uniform(8, 40) if snr is None else snr) * noise / np.sqrt(readings), 0.05)
             return flux * (1 - depth * shape), (epoch, period, duration)
     return None
 
@@ -187,6 +200,11 @@ def load_arrays(path: Path) -> tuple[np.ndarray, np.ndarray]:
     """Cleaned (time, flux) from the cache."""
     with np.load(path, allow_pickle=False) as saved:
         return saved["time"], saved["flux"].astype(np.float64)
+
+
+def curve_arrays(curve: Curve, settings: Settings) -> tuple[np.ndarray, np.ndarray]:
+    """Cleaned (time, flux) for a curve already prepared with `prepare_many`."""
+    return load_arrays(cache_path(settings.curve_cache, curve.data_uri))
 
 
 def injection_seed(data_uri: str) -> int:
@@ -225,6 +243,27 @@ def directory_size(directory: Path) -> int:
     return sum(p.stat().st_size for p in directory.glob("*.npz")) if directory.exists() else 0
 
 
+def download_fits(session: requests.Session, data_uri: str, size_bytes: int, destination: Path) -> Path:
+    """Download one FITS light curve to `destination`, trying each source three times."""
+    sources = download_urls(data_uri)
+    for attempt in range(3 * len(sources)):
+        url, params = sources[attempt % len(sources)]
+        try:
+            with session.get(url, params=params, stream=True, timeout=(20, 120)) as response:
+                response.raise_for_status()
+                with destination.open("wb") as stream:
+                    for chunk in response.iter_content(1024 * 1024):
+                        stream.write(chunk)
+            if destination.stat().st_size != size_bytes:
+                raise OSError(f"downloaded {destination.stat().st_size} bytes, expected {size_bytes}")
+            return destination
+        except (requests.RequestException, OSError):
+            if attempt == 3 * len(sources) - 1:
+                raise
+            time.sleep(attempt // len(sources) + 1)
+    raise AssertionError("unreachable")
+
+
 def prepare_curve(session: requests.Session, data_uri: str, size_bytes: int,
                   cache_dir: Path, free_floor_bytes: int) -> Path:
     """Return the cached cleaned curve, downloading and cleaning it if needed.
@@ -240,23 +279,7 @@ def prepare_curve(session: requests.Session, data_uri: str, size_bytes: int,
         raise StorageFull("free-space floor reached")
     raw = target.with_suffix(f".{os.getpid()}.fits.part")
     try:
-        sources = download_urls(data_uri)
-        for attempt in range(3 * len(sources)):
-            url, params = sources[attempt % len(sources)]
-            try:
-                with session.get(url, params=params, stream=True, timeout=(20, 120)) as response:
-                    response.raise_for_status()
-                    with raw.open("wb") as stream:
-                        for chunk in response.iter_content(1024 * 1024):
-                            stream.write(chunk)
-                if raw.stat().st_size != size_bytes:
-                    raise OSError(f"downloaded {raw.stat().st_size} bytes, expected {size_bytes}")
-                break
-            except (requests.RequestException, OSError):
-                if attempt == 3 * len(sources) - 1:
-                    raise
-                time.sleep(attempt // len(sources) + 1)
-        curve = clean_fits(raw)
+        curve = clean_fits(download_fits(session, data_uri, size_bytes, raw))
         partial = target.with_suffix(f".{os.getpid()}.part")
         with partial.open("wb") as stream:
             np.savez_compressed(stream, time=curve.time, flux=curve.flux.astype(np.float32))

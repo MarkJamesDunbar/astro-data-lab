@@ -16,7 +16,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from astro_data_lab.config import Experiment, Settings
+from astro_data_lab.config import PRETRAIN, Experiment, Settings
 from astro_data_lab.data import labels
 from astro_data_lab.data.lightcurves import Prepared, check_quality, collate, prepare_many
 from astro_data_lab.database import connect, ensure_schema
@@ -137,8 +137,9 @@ def held_out_set(experiment: Experiment, settings: Settings, split: str) -> Prep
     set is the same every time. No injected transits are used here.
     """
     per_class = experiment.validation_curves_per_class
+    target = "transit" if experiment.target == PRETRAIN else experiment.target  # pre-training is probed on transit labels
     with connect() as conn:
-        candidates = labels.fixed_sample(conn, experiment.target, split, per_class * 3)
+        candidates = labels.fixed_sample(conn, target, split, per_class * 3)
     needs_check = [c for c in candidates if c.ephemerides]
     curves = needs_check + labels.balanced_subset([c for c in candidates if not c.ephemerides], per_class)
     print(f"Preparing {split} curves from stars never used for training...", flush=True)
@@ -167,6 +168,9 @@ def evaluate(name: str, settings: Settings, split: str = "test",
         raise SystemExit(f"No trained checkpoint for run '{name}'")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     experiment, model, round_number = load_trained(checkpoint or Path(row[0]), device)
+    if experiment.target == PRETRAIN:
+        raise SystemExit(f"'{name}' is a pre-training run. Fine-tune it (set init_from = \"{name}\" in a "
+                         "transit experiment), then evaluate that run.")
     report = evaluate_curves(model, held_out_set(experiment, settings, split), experiment.classes, device)
     print(f"\n{name}, round {round_number} checkpoint, {split} stars:\n{report.text()}")
     if row[1]:
@@ -174,3 +178,68 @@ def evaluate(name: str, settings: Settings, split: str = "test",
         with mlflow.start_run(run_id=row[1]):
             mlflow.log_metrics(report.metrics(split))
     return report
+
+
+@torch.inference_mode()
+def reconstruction_scores(model: nn.Module, data: Prepared, device: torch.device,
+                          minibatch_size: int = 32) -> tuple[float, float]:
+    """Masked-patch loss and the interpolation baseline's loss on fixed curves and masks.
+
+    The masks are drawn from a fixed seed, so scores are comparable between rounds.
+    """
+    model.eval()
+    generator = torch.Generator(device=device).manual_seed(0)
+    order = sorted(range(len(data.tensors)), key=lambda i: data.tensors[i].shape[-1])
+    totals = [0.0, 0.0]
+    for start in range(0, len(order), minibatch_size):
+        batch = collate([data.tensors[i] for i in order[start:start + minibatch_size]]).to(device)
+        losses = model.reconstruction_loss(batch, generator)
+        for k in range(2):
+            totals[k] += losses[k].item() * batch.shape[0]
+    return totals[0] / len(order), totals[1] / len(order)
+
+
+@torch.inference_mode()
+def curve_embeddings(model: nn.Module, tensors: list[torch.Tensor], device: torch.device,
+                     minibatch_size: int = 32) -> torch.Tensor:
+    """One vector per curve from the encoder (`model.pool`), in input order, on the CPU."""
+    model.eval()
+    order = sorted(range(len(tensors)), key=lambda i: tensors[i].shape[-1])
+    chunks = [model.pool(collate([tensors[i] for i in order[start:start + minibatch_size]]).to(device)).float().cpu()
+              for start in range(0, len(order), minibatch_size)]
+    result = torch.empty(len(tensors), chunks[0].shape[1])
+    result[order] = torch.cat(chunks)
+    return result
+
+
+def linear_probe(model: nn.Module, data: Prepared, classes: tuple[str, ...], device: torch.device,
+                 folds: int = 5) -> Report:
+    """How much class information the frozen encoder already holds.
+
+    A logistic regression on the curve embeddings, scored by k-fold cross-validation
+    (each curve is predicted by a probe that never saw it). No encoder weights change.
+    """
+    features = curve_embeddings(model, data.tensors, device).double()
+    targets = torch.tensor([c.target for c in data.curves])
+    fold = torch.randperm(len(targets), generator=torch.Generator().manual_seed(0)) % folds
+    probabilities = torch.zeros(len(targets), len(classes), dtype=torch.float64)
+    for k in range(folds):
+        train, test = fold != k, fold == k
+        mean, std = features[train].mean(0), features[train].std(0).clamp_min(1e-6)
+        x = (features - mean) / std
+        weight = torch.zeros(x.shape[1], len(classes), dtype=torch.float64, requires_grad=True)
+        bias = torch.zeros(len(classes), dtype=torch.float64, requires_grad=True)
+        balance = 1 / torch.bincount(targets[train], minlength=len(classes)).clamp_min(1).double()
+        optimizer = torch.optim.LBFGS([weight, bias], max_iter=200, line_search_fn="strong_wolfe")
+
+        def objective() -> torch.Tensor:
+            optimizer.zero_grad()
+            loss = F.cross_entropy(x[train] @ weight + bias, targets[train], weight=balance)
+            loss = loss + 1e-2 * weight.pow(2).sum()
+            loss.backward()
+            return loss
+
+        optimizer.step(objective)
+        with torch.no_grad():
+            probabilities[test] = F.softmax(x[test] @ weight + bias, dim=1)
+    return score(targets.numpy(), probabilities.numpy(), classes)

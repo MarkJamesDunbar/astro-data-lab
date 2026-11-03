@@ -17,6 +17,7 @@ if more than `max_bad_fraction` of its curves are bad (that signals an outage).
 """
 from __future__ import annotations
 
+import collections
 import dataclasses
 import fcntl
 import json
@@ -29,21 +30,24 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import mlflow
+import pandas as pd
 import torch
 from mlflow.exceptions import MlflowException
 from mlflow.tracking import MlflowClient
 from torch.nn import functional as F
 from torch.nn.utils import clip_grad_norm_
 
-from astro_data_lab.config import Experiment, Settings
+from astro_data_lab.config import PRETRAIN, TARGETS, Experiment, Settings
 from astro_data_lab.data import labels
 from astro_data_lab.data.labels import NO_SIGNAL, SIGNAL, Curve
 from astro_data_lab.data.lightcurves import (
     INPUT_VERSION, Prepared, cache_path, check_quality, collate, prepare_many,
 )
-from astro_data_lab.database import connect, ensure_schema
+from astro_data_lab.database import connect, ensure_schema, refresh_statistics
 from astro_data_lab.models import build_model
-from astro_data_lab.training.evaluation import evaluate_curves, held_out_set
+from astro_data_lab.training.evaluation import (
+    evaluate_curves, held_out_set, linear_probe, reconstruction_scores,
+)
 
 STREAM_CLASS_ABOVE = 20_000  # classes with more training curves than this are streamed
 _DONE = object()
@@ -119,7 +123,31 @@ class RoundSampler:
         return chosen, streamed
 
 
-def _produce(plan: RoundSampler, first: int, last: int | None, settings: Settings,
+class UnlabelledSampler:
+    """Pre-training: each round takes training-split curves of any kind that this run has never used,
+    until every one has been seen once. Curves already cached (e.g. signals) are kept; the rest are
+    streamed and deleted after their round."""
+
+    def __init__(self, experiment: Experiment, run_id: int, settings: Settings) -> None:
+        self.experiment, self.run_id, self.settings = experiment, run_id, settings
+        self.recent: collections.deque[set[str]] = collections.deque(maxlen=3)  # selected, not yet committed
+        with connect() as conn:
+            total, unused = labels.unlabelled_training_count(conn, run_id)
+        print(f"Pre-training on unlabelled training-split curves: {unused:,} of {total:,} not used yet "
+              f"(about {-(-unused // experiment.curves_per_round)} rounds).", flush=True)
+
+    def select(self, number: int) -> tuple[list[Curve], list[Curve]] | None:
+        with connect() as conn:
+            fresh = labels.unseen_unlabelled_curves(conn, self.run_id, self.experiment.curves_per_round,
+                                                    self.experiment.seed, set().union(*self.recent))
+        if not fresh:
+            return None
+        self.recent.append({c.data_uri for c in fresh})
+        streamed = [c for c in fresh if not cache_path(self.settings.curve_cache, c.data_uri).exists()]
+        return fresh, streamed
+
+
+def _produce(plan: RoundSampler | UnlabelledSampler, first: int, last: int | None, settings: Settings,
              output: queue.Queue, stop: threading.Event) -> None:
     def put(item: object) -> None:
         while not stop.is_set():
@@ -174,6 +202,60 @@ def train_one_round(model: torch.nn.Module, optimizer: torch.optim.Optimizer, da
     return total / max(1, trained), steps, skipped
 
 
+def pretrain_one_round(model: torch.nn.Module, optimizer: torch.optim.Optimizer, data: Prepared,
+                       minibatch_size: int, device: torch.device, seed: int) -> tuple[float, float, int, int]:
+    """One self-supervised pass: hide random patches, learn to fill them in.
+
+    Returns mean masked loss, the interpolation baseline's loss, steps, skipped minibatches.
+    """
+    model.train()
+    order = torch.randperm(len(data.tensors), generator=torch.Generator().manual_seed(seed))
+    masks = torch.Generator(device=device).manual_seed(seed)
+    total = baseline_total = 0.0
+    steps = skipped = seen = 0
+    for start in range(0, len(order), minibatch_size):
+        index = order[start:start + minibatch_size].tolist()
+        inputs = collate([data.tensors[i] for i in index]).to(device, non_blocking=True)
+        loss, baseline = model.reconstruction_loss(inputs, masks)
+        if not torch.isfinite(loss):
+            skipped += 1
+            continue
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        total += loss.item() * len(index)
+        baseline_total += baseline.item() * len(index)
+        seen += len(index)
+        steps += 1
+    if skipped > max(1, steps // 10):
+        raise RuntimeError(f"{skipped} minibatches produced non-finite loss; lower learning_rate")
+    return total / max(1, seen), baseline_total / max(1, seen), steps, skipped
+
+
+def _initialise_from(model: torch.nn.Module, source: str, device: torch.device) -> None:
+    """Copy every weight whose name and shape match from a run's best checkpoint (or a file)."""
+    path = Path(source)
+    if not path.is_file():
+        with connect() as conn:
+            row = conn.execute("SELECT best_checkpoint_path FROM training_runs WHERE name = %s",
+                               (source,)).fetchone()
+        if row is None or not row[0]:
+            raise RuntimeError(f"init_from = '{source}' is neither a checkpoint file nor a run with a checkpoint")
+        path = Path(row[0])
+    saved = torch.load(path, map_location=device, weights_only=True)
+    if saved.get("input_version", 1) != INPUT_VERSION:
+        raise RuntimeError(f"{path} was trained on older model inputs and cannot be reused")
+    own = model.state_dict()
+    matching = {k: v for k, v in saved["model"].items() if k in own and own[k].shape == v.shape}
+    if not matching:
+        raise RuntimeError(f"No weights in {path} match this model; check the [model.options]")
+    model.load_state_dict(matching, strict=False)
+    fresh = sorted(set(own) - set(matching))
+    print(f"Initialised {len(matching)}/{len(own)} weight tensors from {path} (round {saved.get('round')}); "
+          f"starting fresh: {', '.join(fresh) or 'none'}", flush=True)
+
+
 def _save(path: Path, contents: dict) -> None:
     temporary = path.with_suffix(".tmp")
     torch.save(contents, temporary)
@@ -187,7 +269,11 @@ def _open_run(experiment: Experiment) -> tuple[int, dict]:
         row = conn.execute("SELECT id, config, rounds_completed, checkpoint_path, "
                            "best_validation_score, mlflow_run_id FROM training_runs WHERE name = %s",
                            (experiment.name,)).fetchone()
-    if row[1] != experiment.to_dict():
+    try:
+        stored = Experiment(**row[1]).to_dict()  # fills settings added since the run started
+    except (TypeError, ValueError):
+        stored = row[1]
+    if stored != experiment.to_dict():
         raise RuntimeError(f"Run '{experiment.name}' already exists with different settings. "
                            "Give the experiment a new name.")
     return row[0], {"rounds": row[2], "checkpoint": row[3], "best": row[4], "mlflow": row[5]}
@@ -219,6 +305,7 @@ def _mlflow_run(settings: Settings, experiment: Experiment, run_id: int, existin
 def train(experiment: Experiment, settings: Settings, rounds: int | None = None) -> None:
     """Train (or resume) `experiment`. Ctrl+C stops safely after the last saved round."""
     ensure_schema()
+    refresh_statistics()
     run_dir = settings.checkpoints / experiment.name
     run_dir.mkdir(parents=True, exist_ok=True)
     with (settings.checkpoints / ".trainer.lock").open("a+") as lock:
@@ -235,7 +322,8 @@ def _train_locked(experiment: Experiment, settings: Settings, run_dir: Path, rou
     if device.type == "cpu":
         print("WARNING: no CUDA GPU found; training on CPU will be slow.", flush=True)
     torch.manual_seed(experiment.seed)
-    model = build_model(experiment.factory, len(experiment.classes), experiment.options).to(device)
+    pretraining = experiment.target == PRETRAIN
+    model = build_model(experiment.factory, len(experiment.classes) or 1, experiment.options).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=experiment.learning_rate,
                                   weight_decay=experiment.weight_decay)
     if state["checkpoint"]:
@@ -246,6 +334,8 @@ def _train_locked(experiment: Experiment, settings: Settings, run_dir: Path, rou
         model.load_state_dict(saved["model"])
         optimizer.load_state_dict(saved["optimizer"])
         print(f"Resuming '{experiment.name}' after round {state['rounds']}.", flush=True)
+    elif experiment.init_from:
+        _initialise_from(model, experiment.init_from, device)
     for stale in run_dir.glob("round_*.pt"):  # rounds saved but never committed
         if str(stale) != state["checkpoint"]:
             stale.unlink()
@@ -253,7 +343,8 @@ def _train_locked(experiment: Experiment, settings: Settings, run_dir: Path, rou
     print(f"Model {experiment.factory}: {parameters:,} parameters on {device}.", flush=True)
 
     validation = held_out_set(experiment, settings, "validation")
-    plan = RoundSampler(experiment, run_id, settings)
+    plan = (UnlabelledSampler if pretraining else RoundSampler)(experiment, run_id, settings)
+    finish = _finish_pretrain_round if pretraining else _finish_round
     mlflow_id = _mlflow_run(settings, experiment, run_id, state["mlflow"])
     # `rounds` (from the command line) means "this many more"; otherwise train up to
     # experiment.rounds in total, or indefinitely when it is 0.
@@ -266,6 +357,8 @@ def _train_locked(experiment: Experiment, settings: Settings, run_dir: Path, rou
     best = state["best"]
     try:
         with mlflow.start_run(run_id=mlflow_id):
+            if pretraining and state["rounds"] == 0:
+                _log_pretrain_scores(model, validation, device, 0)  # the untrained encoder, for comparison
             while True:
                 waited = time.monotonic()
                 item = rounds_queue.get()
@@ -274,8 +367,8 @@ def _train_locked(experiment: Experiment, settings: Settings, run_dir: Path, rou
                     break
                 if isinstance(item, BaseException):
                     raise RuntimeError("Preparing training data failed") from item
-                best = _finish_round(item, model, optimizer, experiment, validation, device,
-                                     run_id, run_dir, best, waited)
+                best = finish(item, model, optimizer, experiment, validation, device,
+                              run_id, run_dir, best, waited)
     except KeyboardInterrupt:
         print("Stopped. Run the same command again to resume from the last saved round.", flush=True)
     finally:
@@ -283,28 +376,19 @@ def _train_locked(experiment: Experiment, settings: Settings, run_dir: Path, rou
         producer.join(timeout=60)
 
 
-def _finish_round(item: Round, model: torch.nn.Module, optimizer: torch.optim.Optimizer,
-                  experiment: Experiment, validation: Prepared, device: torch.device,
-                  run_id: int, run_dir: Path, best: float | None, waited: float) -> float | None:
-    started = time.monotonic()
-    steps = skipped = 0
-    for repeat in range(experiment.passes_per_round):
-        loss, done, bad = train_one_round(model, optimizer, item.data, experiment.minibatch_size, device,
-                                          (experiment.seed * 100_003 + item.number) * 101 + repeat)
-        steps, skipped = steps + done, skipped + bad
-    report = evaluate_curves(model, validation, experiment.classes, device)
-    if device.type == "cuda":
-        torch.cuda.synchronize()
-    gpu_seconds = time.monotonic() - started
-
+def _commit_round(item: Round, model: torch.nn.Module, optimizer: torch.optim.Optimizer,
+                  experiment: Experiment, run_id: int, run_dir: Path, score: float,
+                  best: float | None, metrics: dict[str, float]) -> tuple[float, bool]:
+    """Save the checkpoint (and best.pt if `score` improved), record the curves used,
+    then delete the round's streamed files. Higher `score` is better."""
     path = run_dir / f"round_{item.number:05d}.pt"
     _save(path, {"experiment": experiment.to_dict(), "round": item.number,
                  "input_version": INPUT_VERSION,
                  "model": model.state_dict(), "optimizer": optimizer.state_dict(),
-                 "validation": report.metrics("validation")})
-    improved = best is None or report.balanced_accuracy > best
+                 "validation": metrics})
+    improved = best is None or score > best
     if improved:
-        best = report.balanced_accuracy
+        best = score
         shutil.copyfile(path, run_dir / "best.tmp")
         (run_dir / "best.tmp").replace(run_dir / "best.pt")
     with connect() as conn:
@@ -323,6 +407,68 @@ def _finish_round(item: Round, model: torch.nn.Module, optimizer: torch.optim.Op
             old.unlink()
     for streamed in item.streamed:
         streamed.unlink(missing_ok=True)
+    return best, improved
+
+
+def _log_pretrain_scores(model: torch.nn.Module, validation: Prepared, device: torch.device,
+                         step: int) -> tuple[float, float, float, float]:
+    """Masked loss, baseline, reconstruction skill and linear-probe balanced accuracy on validation stars."""
+    loss, baseline = reconstruction_scores(model, validation, device)
+    skill = 1 - loss / baseline
+    probe = linear_probe(model, validation, TARGETS["transit"], device)
+    mlflow.log_metrics({"validation_masked_loss": loss, "validation_interpolation_loss": baseline,
+                        "validation_reconstruction_skill": skill,
+                        **probe.metrics("validation_probe")}, step=step)
+    if step == 0:
+        print(f"Untrained encoder: reconstruction skill {skill:.3f}, probe balanced acc "
+              f"{probe.balanced_accuracy:.3f} (chance 0.500)", flush=True)
+    return loss, baseline, skill, probe.balanced_accuracy
+
+
+def _finish_pretrain_round(item: Round, model: torch.nn.Module, optimizer: torch.optim.Optimizer,
+                           experiment: Experiment, validation: Prepared, device: torch.device,
+                           run_id: int, run_dir: Path, best: float | None, waited: float) -> float | None:
+    started = time.monotonic()
+    steps = skipped = 0
+    for repeat in range(experiment.passes_per_round):
+        loss, baseline, done, bad = pretrain_one_round(
+            model, optimizer, item.data, experiment.minibatch_size, device,
+            (experiment.seed * 100_003 + item.number) * 101 + repeat)
+        steps, skipped = steps + done, skipped + bad
+    _, _, skill, probe = _log_pretrain_scores(model, validation, device, item.number)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    gpu_seconds = time.monotonic() - started
+    best, improved = _commit_round(item, model, optimizer, experiment, run_id, run_dir, skill, best,
+                                   {"validation_reconstruction_skill": skill, "validation_probe_balanced_accuracy": probe})
+    mlflow.log_metrics({"train_masked_loss": loss, "train_interpolation_loss": baseline,
+                        "optimizer_steps": steps, "skipped_minibatches": skipped,
+                        "curves_trained": len(item.data.curves), "excluded_curves": item.data.excluded,
+                        "failed_downloads": item.data.failed, "gpu_seconds": gpu_seconds,
+                        "waiting_for_data_seconds": waited}, step=item.number)
+    print(f"Round {item.number}: {len(item.data.curves)} curves, {steps} steps, masked loss {loss:.4f} "
+          f"(interpolation {baseline:.4f}) | validation skill {skill:.3f}, probe balanced acc {probe:.3f} "
+          f"(chance 0.500){' *best*' if improved else ''} | GPU {gpu_seconds:.0f}s, waited {waited:.0f}s for data",
+          flush=True)
+    return best
+
+
+def _finish_round(item: Round, model: torch.nn.Module, optimizer: torch.optim.Optimizer,
+                  experiment: Experiment, validation: Prepared, device: torch.device,
+                  run_id: int, run_dir: Path, best: float | None, waited: float) -> float | None:
+    started = time.monotonic()
+    steps = skipped = 0
+    for repeat in range(experiment.passes_per_round):
+        loss, done, bad = train_one_round(model, optimizer, item.data, experiment.minibatch_size, device,
+                                          (experiment.seed * 100_003 + item.number) * 101 + repeat)
+        steps, skipped = steps + done, skipped + bad
+    report = evaluate_curves(model, validation, experiment.classes, device)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    gpu_seconds = time.monotonic() - started
+
+    best, improved = _commit_round(item, model, optimizer, experiment, run_id, run_dir,
+                                   report.balanced_accuracy, best, report.metrics("validation"))
 
     injected = sum(c.inject for c in item.data.curves)
     mlflow.log_metrics({"train_loss": loss, "optimizer_steps": steps, "skipped_minibatches": skipped,
@@ -340,6 +486,32 @@ def _finish_round(item: Round, model: torch.nn.Module, optimizer: torch.optim.Op
     return best
 
 
+def history(name: str, settings: Settings) -> pd.DataFrame:
+    """Every per-round metric logged for a run, one row per round (read from MLflow).
+
+    One-off `test_*` scores from `evaluate` are left out; they are not per-round.
+    """
+    with connect() as conn:
+        row = conn.execute("SELECT mlflow_run_id FROM training_runs WHERE name = %s", (name,)).fetchone()
+    if row is None or row[0] is None:
+        raise ValueError(f"No MLflow history for run '{name}'")
+    client = MlflowClient(settings.mlflow_uri)
+    columns = {}
+    for metric in client.get_run(row[0]).data.metrics:
+        if metric.startswith("test_"):
+            continue
+        columns[metric] = {m.step: m.value for m in client.get_metric_history(row[0], metric)}
+    return pd.DataFrame(columns).sort_index().rename_axis("round")
+
+
+def delete_run(name: str, settings: Settings) -> None:
+    """Forget a run: its PostgreSQL records and checkpoints (MLflow keeps its history)."""
+    ensure_schema()
+    with connect() as conn:
+        conn.execute("DELETE FROM training_runs WHERE name = %s", (name,))
+    shutil.rmtree(settings.checkpoints / name, ignore_errors=True)
+
+
 def status(name: str) -> None:
     ensure_schema()
     with connect() as conn:
@@ -355,6 +527,8 @@ def status(name: str) -> None:
     print(f"  rounds completed: {row[1]}")
     print(f"  examples trained: {used[0]:,} ({used[1]:,} distinct curves)")
     best = "none yet" if row[2] is None else f"{row[2]:.3f}"
-    print(f"  best validation balanced accuracy: {best}")
+    measure = ("reconstruction skill (0 = no better than interpolating, 1 = perfect)"
+               if row[5] == PRETRAIN else "balanced accuracy")
+    print(f"  best validation {measure}: {best}")
     print(f"  best checkpoint: {row[3]}")
     print(f"  curves excluded as unusable (all runs): {excluded:,}")

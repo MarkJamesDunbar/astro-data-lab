@@ -48,6 +48,10 @@ class LabTests(unittest.TestCase):
         for path in sorted((ROOT / "experiments").glob("*.toml")):
             with self.subTest(path=path.name):
                 experiment = Experiment.load(path)
+                if experiment.target == "pretrain":  # no classes; still a valid encoder
+                    self.assertEqual(experiment.classes, ())
+                    build_model(experiment.factory, 1, experiment.options)
+                    continue
                 self.assertEqual(experiment.classes, ("no_signal", "signal"))
                 check_model(build_model(experiment.factory, 2, experiment.options), 2)
         with tempfile.TemporaryDirectory() as directory:
@@ -219,6 +223,100 @@ class LabTests(unittest.TestCase):
         self.assertEqual((mast, params), (DOWNLOAD_URL, {"uri": uri}))
         self.assertEqual(download_urls("mast:TESS/product/unexpected.fits"),
                          [(DOWNLOAD_URL, {"uri": "mast:TESS/product/unexpected.fits"})])
+
+    def test_predicted_transit_times_inside_a_curve(self):
+        from astro_data_lab.data.lightcurves import transit_centres
+
+        time = np.linspace(100.0, 127.0, 5000)
+        centres = transit_centres(time, ((101.5, 5.0, 0.1), (200.0, 0.0, 0.1), (110.0, 0.0, 0.1)))
+        self.assertEqual(centres.tolist(), [101.5, 106.5, 110.0, 111.5, 116.5, 121.5, 126.5])
+
+    def test_download_falls_back_to_mast_when_s3_fails(self):
+        from unittest import mock
+
+        import requests
+
+        from astro_data_lab.data import lightcurves
+
+        class Response:
+            def __init__(self, ok):
+                self.ok = ok
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def raise_for_status(self):
+                if not self.ok:
+                    raise requests.HTTPError("503")
+
+            def iter_content(self, _):
+                yield b"x" * 10
+
+        session = mock.Mock()
+        session.get.side_effect = lambda url, **_: Response("mast.stsci.edu" in url)
+        uri = "mast:TESS/product/tess2019357164649-s0020-0000000367103210-0165-s_lc.fits"
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(lightcurves.time, "sleep"):
+            path = lightcurves.download_fits(session, uri, 10, Path(directory) / "x.fits")
+            self.assertEqual(path.read_bytes(), b"x" * 10)
+        self.assertIn("stpubdata", session.get.call_args_list[0].args[0])
+        self.assertIn("mast.stsci.edu", session.get.call_args_list[1].args[0])
+
+    def test_interpolation_baseline_averages_nearest_visible_patches(self):
+        from astro_data_lab.models.foundation import _neighbour_estimate
+
+        means = torch.tensor([1.0, 9.0, 3.0, 9.0, 9.0, 7.0])           # per-patch level
+        features = means.view(1, 6, 1, 1).expand(1, 6, 3, 4).clone()
+        valid = torch.ones(1, 6, 4, dtype=torch.bool)
+        hidden = torch.tensor([[False, True, False, True, True, False]])
+        estimate = _neighbour_estimate(features, valid, hidden)[0, :, 0, 0]
+        self.assertEqual(estimate[[1, 3, 4]].tolist(), [2.0, 5.0, 5.0])  # (1+3)/2, (3+7)/2, (3+7)/2
+
+    def test_pretraining_updates_the_encoder_and_transfers_to_a_classifier(self):
+        from astro_data_lab.data.lightcurves import INPUT_VERSION
+        from astro_data_lab.models import MaskedPatchPretrainer, PatchTransformer
+        from astro_data_lab.training.trainer import _initialise_from, pretrain_one_round
+
+        torch.manual_seed(0)
+        rng = np.random.default_rng(0)
+        data = Prepared([Curve(str(i), 1, -1) for i in range(16)],
+                        [synthetic_curve(bool(i % 2), rng) for i in range(16)], 0, 0)
+        options = {"width": 32, "depth": 2, "heads": 4}
+        model = MaskedPatchPretrainer(**options)
+        before = {k: v.clone() for k, v in model.state_dict().items()}
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        loss, baseline, steps, skipped = pretrain_one_round(model, optimizer, data, 8, torch.device("cpu"), 0)
+        self.assertTrue(np.isfinite(loss) and np.isfinite(baseline) and steps == 2 and skipped == 0)
+        self.assertFalse(torch.equal(before["encoder.layers.0.linear1.weight"], model.encoder.layers[0].linear1.weight))
+        self.assertTrue(torch.equal(before["head.weight"], model.head.weight))  # head is not pre-trained
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "best.pt"
+            torch.save({"model": model.state_dict(), "round": 1, "input_version": INPUT_VERSION}, path)
+            classifier = PatchTransformer(num_classes=2, **options)
+            _initialise_from(classifier, str(path), torch.device("cpu"))
+        self.assertTrue(torch.equal(classifier.encoder.layers[1].linear2.weight, model.encoder.layers[1].linear2.weight))
+        self.assertTrue(torch.equal(classifier.embed.weight, model.embed.weight))
+        check_model(classifier, 2)
+
+    def test_pretrain_experiments_have_no_classes(self):
+        experiment = Experiment(name="p", target="pretrain")
+        self.assertEqual(experiment.classes, ())
+        self.assertEqual(Experiment.load(ROOT / "experiments" / "foundation_pretrain.toml").target, "pretrain")
+
+    def test_injection_with_fixed_snr_is_reproducible_and_scales_depth(self):
+        from astro_data_lab.data.lightcurves import inject_transit, point_noise
+
+        rng = np.random.default_rng(3)
+        time = np.arange(18000) / 720.0
+        flux = 1 + rng.normal(0, 1e-3, 18000)
+        weak, _ = inject_transit(time, flux, seed=11, snr=10)
+        strong, _ = inject_transit(time, flux, seed=11, snr=40)
+        self.assertTrue(np.array_equal(inject_transit(time, flux, seed=11)[0], inject_transit(time, flux, seed=11)[0]))
+        self.assertAlmostEqual((flux - strong).max() / (flux - weak).max(), 4.0, places=6)
+        self.assertGreater((flux - weak).max(), 3 * point_noise(flux) / np.sqrt(1000))
 
     def test_help_needs_no_database_or_gpu(self):
         output = io.StringIO()
