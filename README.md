@@ -78,6 +78,23 @@ for x, mask, y in loader:
 Other commands: `astro-data-lab cache` shows the cache size. Run the tests with
 `uv run python -m unittest discover tests` (no database or network needed).
 
+### Weekly updates
+
+The installed user systemd timers run catalogue sync on Sundays at 03:00 and
+manifest sync on Mondays at 03:00 (system local time):
+
+```sh
+uv run --env-file .env astro-data-lab sync --only catalogues
+uv run --env-file .env astro-data-lab sync --only manifest --max-sectors 2 --refresh-one
+```
+
+Catalogue sync refreshes TOIs and confirmed planets. Manifest sync indexes up to
+two new sectors and refreshes the oldest previously indexed sector to pick up
+new or changed products. These jobs download metadata, not light-curve payloads.
+The installed units live in `~/.config/systemd/user/`; they are not installed by
+`uv sync`. Check schedules with `systemctl --user list-timers 'astro-*'` and logs
+with `journalctl --user -u astro-catalogues.service -u astro-mast.service`.
+
 ## Layout
 
 ```

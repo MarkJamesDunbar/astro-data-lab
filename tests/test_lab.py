@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader
 from astro_data_lab import LightCurveDataset, LightCurveUnavailable, pad_collate, read_lightcurve, report, split_of
 from astro_data_lab import lightcurves
 from astro_data_lab.cli import main
+from astro_data_lab.sync import sync
 
 URI = "mast:TESS/product/tess2019357164649-s0020-0000000367103210-0165-s_lc.fits"
 
@@ -149,6 +150,61 @@ class Functions(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()) as output:
             main([])
         self.assertIn("sync", output.getvalue())
+
+
+class ScheduledSync(unittest.TestCase):
+    def test_weekly_catalogue_command(self):
+        with mock.patch("astro_data_lab.sync.sync") as run:
+            main(["sync", "--only", "catalogues"])
+        run.assert_called_once_with(catalogues=True, manifest=False, max_sectors=2, refresh_one=False)
+
+    def test_weekly_manifest_command(self):
+        with mock.patch("astro_data_lab.sync.sync") as run:
+            main(["sync", "--only", "manifest", "--max-sectors", "2", "--refresh-one"])
+        run.assert_called_once_with(catalogues=False, manifest=True, max_sectors=2, refresh_one=True)
+
+    def test_refresh_requires_manifest(self):
+        with mock.patch("astro_data_lab.sync.sync") as run, contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as error:
+                main(["sync", "--only", "catalogues", "--refresh-one"])
+        self.assertEqual(error.exception.code, 2)
+        run.assert_not_called()
+
+    def test_catalogue_sync_does_not_run_manifest(self):
+        with mock.patch("astro_data_lab.sync.ensure_schema") as schema, \
+             mock.patch("astro_data_lab.sync.catalogues.synchronise_catalogues") as catalogues, \
+             mock.patch("astro_data_lab.sync.manifest.sync_incremental") as manifest:
+            sync(catalogues=True, manifest=False)
+        schema.assert_called_once_with()
+        catalogues.assert_called_once_with()
+        manifest.assert_not_called()
+
+    def test_manifest_sync_forwards_refresh_under_lock(self):
+        from pathlib import Path
+
+        with mock.patch.dict(os.environ, {"MAST_INVENTORY_DIR": "/tmp/test-inventory"}), \
+             mock.patch("astro_data_lab.sync.ensure_schema"), \
+             mock.patch("astro_data_lab.sync.catalogues.synchronise_catalogues") as catalogues, \
+             mock.patch("astro_data_lab.sync.manifest.inventory_lock") as lock, \
+             mock.patch("astro_data_lab.sync.manifest.sync_incremental") as manifest:
+            sync(catalogues=False, manifest=True, max_sectors=2, refresh_one=True)
+        catalogues.assert_not_called()
+        lock.assert_called_once_with(Path("/tmp/test-inventory"))
+        lock.return_value.__enter__.assert_called_once()
+        manifest.assert_called_once_with(Path("/tmp/test-inventory"), 1, 2, refresh_one=True)
+
+    def test_refreshes_existing_sector_even_if_no_new_data(self):
+        from pathlib import Path
+        from astro_data_lab.sync.manifest import sync_incremental
+
+        with mock.patch("astro_data_lab.sync.manifest.completed_sectors", return_value={1, 2}), \
+             mock.patch("astro_data_lab.sync.manifest.query_sector_observations", return_value=[]) as query, \
+             mock.patch("astro_data_lab.sync.manifest.oldest_completed_sector", return_value=1), \
+             mock.patch("astro_data_lab.sync.manifest.sync_sector") as sector, \
+             contextlib.redirect_stdout(io.StringIO()):
+            sync_incremental(Path("/tmp/test-inventory"), 1, 2, refresh_one=True)
+        query.assert_called_once_with(3)
+        sector.assert_called_once_with(1, Path("/tmp/test-inventory"), 1, 1)
 
 
 if __name__ == "__main__":
